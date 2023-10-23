@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use vulkano::{
     device::{
-        physical::PhysicalDevice, Device, DeviceCreateInfo, DeviceExtensions, Features,
+        physical::PhysicalDevice, Device, DeviceCreateInfo, DeviceExtensions, Features, Queue,
         QueueCreateInfo, QueueFlags,
     },
     instance::{
@@ -10,39 +10,77 @@ use vulkano::{
         Instance, InstanceCreateInfo, InstanceExtensions,
     },
     library::VulkanLibrary,
+    swapchain::Surface,
     Version,
 };
+use winit::{
+    event_loop::EventLoop,
+    window::{Window, WindowBuilder},
+};
+
+use self::renderer::Renderer;
+
+pub mod renderer;
 
 const REQUIRED_VALIDATION_LAYERS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
 
 struct QueueFamilyIndices {
-    graphics_family: Option<u32>,
+    graphic_family: Option<u32>,
+    present_family: Option<u32>,
+}
+
+pub(crate) struct Queues {
+    graphic_queue: Arc<Queue>,
+    present_queue: Arc<Queue>,
 }
 
 pub struct Engine {
     _vulkan_instance: Arc<Instance>,
     _debug_messenger: DebugUtilsMessenger,
 
-    _device: Arc<Device>,
+    window: Arc<Window>,
+    surface: Arc<Surface>,
+
+    device: Arc<Device>,
+    queues: Queues,
 }
 
 impl QueueFamilyIndices {
     fn is_complete(&self) -> bool {
-        self.graphics_family.is_some()
+        self.graphic_family.is_some() && self.present_family.is_some()
     }
 }
 
 impl Engine {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> (Self, EventLoop<()>) {
         let instance = Self::create_instance();
         let debug_messenger = Self::create_debug_messenger(&instance);
-        let device = Self::create_logical_device(&instance);
 
-        Self {
+        let event_loop = EventLoop::new();
+        let (window, surface) = Self::create_window(&instance, &event_loop);
+
+        let (device, queues) = Self::create_logical_device(&instance, &surface);
+
+        let engine = Self {
             _vulkan_instance: instance,
             _debug_messenger: debug_messenger,
-            _device: device,
-        }
+
+            window,
+            surface,
+
+            device,
+            queues,
+        };
+
+        (engine, event_loop)
+    }
+
+    pub(crate) fn get_window(&self) -> &Arc<Window> {
+        &self.window
+    }
+
+    pub fn create_renderer(&self) -> Renderer {
+        Renderer::new(&self.device, &self.surface, &self.window, &self.queues)
     }
 
     fn create_instance() -> Arc<Instance> {
@@ -51,6 +89,8 @@ impl Engine {
         let mut enabled_extensions = InstanceExtensions::empty();
         enabled_extensions.ext_validation_features = true;
         enabled_extensions.ext_debug_utils = true;
+        enabled_extensions.khr_xcb_surface = true;
+        enabled_extensions.khr_surface = true;
 
         let layer_properties = library
             .layer_properties()
@@ -98,14 +138,43 @@ impl Engine {
         }
     }
 
-    fn find_queue_family_indices(device: &Arc<PhysicalDevice>) -> QueueFamilyIndices {
+    fn create_window(
+        instance: &Arc<Instance>,
+        event_loop: &EventLoop<()>,
+    ) -> (Arc<Window>, Arc<Surface>) {
+        let window = WindowBuilder::new()
+            .with_title("Vulkan application")
+            .with_resizable(false)
+            .build(event_loop)
+            .expect("Failed to create window");
+
+        let window = Arc::new(window);
+
+        let surface = vulkano_win::create_surface_from_winit(window.clone(), instance.clone())
+            .expect("Failed to create window surface");
+
+        (window, surface)
+    }
+
+    fn find_queue_family_indices(
+        device: &Arc<PhysicalDevice>,
+        surface: &Arc<Surface>,
+    ) -> QueueFamilyIndices {
         let mut indices = QueueFamilyIndices {
-            graphics_family: None,
+            graphic_family: None,
+            present_family: None,
         };
 
         for (i, queue_family) in device.queue_family_properties().iter().enumerate() {
             if queue_family.queue_flags.contains(QueueFlags::GRAPHICS) {
-                indices.graphics_family = Some(i as u32);
+                indices.graphic_family = Some(i as u32);
+            }
+
+            if device
+                .surface_support(i as u32, surface.as_ref())
+                .expect("Failed to check surface support")
+            {
+                indices.present_family = Some(i as u32);
             }
 
             if indices.is_complete() {
@@ -116,17 +185,20 @@ impl Engine {
         indices
     }
 
-    fn is_device_suitable(device: &Arc<PhysicalDevice>) -> bool {
-        Self::find_queue_family_indices(device).is_complete()
+    fn is_device_suitable(device: &Arc<PhysicalDevice>, surface: &Arc<Surface>) -> bool {
+        Self::find_queue_family_indices(device, surface).is_complete()
     }
 
-    fn choose_physical_device(instance: &Arc<Instance>) -> Arc<PhysicalDevice> {
+    fn choose_physical_device(
+        instance: &Arc<Instance>,
+        surface: &Arc<Surface>,
+    ) -> Arc<PhysicalDevice> {
         for device in instance
             .enumerate_physical_devices()
             .expect("Failed to enumerate physical devices")
             .into_iter()
         {
-            if Self::is_device_suitable(&device) {
+            if Self::is_device_suitable(&device, surface) {
                 return device;
             }
         }
@@ -134,14 +206,19 @@ impl Engine {
         panic!("Failed to find suitable device");
     }
 
-    fn create_logical_device(instance: &Arc<Instance>) -> Arc<Device> {
-        let physical_device = Self::choose_physical_device(instance);
+    fn create_logical_device(
+        instance: &Arc<Instance>,
+        surface: &Arc<Surface>,
+    ) -> (Arc<Device>, Queues) {
+        let physical_device = Self::choose_physical_device(instance, surface);
 
-        let enabled_extensions = DeviceExtensions::empty();
+        let mut enabled_extensions = DeviceExtensions::empty();
+        enabled_extensions.khr_swapchain = true;
+
         let enabled_features = Features::empty();
 
-        let indices = Self::find_queue_family_indices(&physical_device);
-        let mut unique_indices = vec![indices.graphics_family.unwrap()];
+        let indices = Self::find_queue_family_indices(&physical_device, surface);
+        let mut unique_indices = vec![indices.graphic_family.unwrap()];
         unique_indices.sort();
         unique_indices.dedup();
 
@@ -162,7 +239,18 @@ impl Engine {
         };
 
         match Device::new(physical_device, device_info) {
-            Ok((device, _queues)) => device,
+            Ok((device, queues)) => {
+                let mut queues = queues.into_iter();
+                let graphic_queue = queues.next().unwrap();
+                let present_queue = queues.next().unwrap_or(graphic_queue.clone());
+
+                let queues = Queues {
+                    graphic_queue,
+                    present_queue,
+                };
+
+                (device, queues)
+            }
             Err(error) => panic!("Failed to create logical device: {:?}", error),
         }
     }
