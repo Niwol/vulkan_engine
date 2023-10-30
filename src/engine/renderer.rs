@@ -1,27 +1,42 @@
 use std::sync::Arc;
 
+use smallvec::smallvec;
+
 use vulkano::{
     command_buffer::{
         allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
         AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
-        RenderPassBeginInfo, SubpassContents,
+        RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
     },
     device::Device,
     format::{ClearValue, Format},
     image::{
-        view::{ImageView, ImageViewCreateInfo},
-        ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, ImageViewType, SampleCount,
-        SwapchainImage,
+        sampler::ComponentMapping,
+        view::{ImageView, ImageViewCreateInfo, ImageViewType},
+        Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount,
     },
     pipeline::{
-        graphics::viewport::{Scissor, Viewport, ViewportState},
-        GraphicsPipeline,
+        graphics::{
+            color_blend::{
+                ColorBlendAttachmentState, ColorBlendState, ColorBlendStateFlags, ColorComponents,
+            },
+            input_assembly::{InputAssemblyState, PrimitiveTopology},
+            multisample::MultisampleState,
+            rasterization::{
+                CullMode, FrontFace, LineRasterizationMode, PolygonMode, RasterizationState,
+            },
+            vertex_input::{Vertex, VertexDefinition},
+            viewport::{Scissor, Viewport, ViewportState},
+            GraphicsPipelineCreateInfo,
+        },
+        layout::{PipelineLayoutCreateFlags, PipelineLayoutCreateInfo},
+        GraphicsPipeline, PipelineCreateFlags, PipelineLayout, PipelineShaderStageCreateInfo,
     },
     render_pass::{
-        AttachmentDescription, AttachmentReference, Framebuffer, FramebufferCreateInfo, LoadOp,
-        RenderPass, RenderPassCreateInfo, StoreOp, Subpass, SubpassDescription,
+        AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp,
+        Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass,
+        SubpassDescription,
     },
-    sampler::ComponentMapping,
     swapchain::{
         self, ColorSpace, CompositeAlpha, FullScreenExclusive, PresentMode, Surface,
         SurfaceCapabilities, SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
@@ -30,7 +45,10 @@ use vulkano::{
 };
 use winit::window::Window;
 
-use super::Queues;
+use super::{
+    render_object::{RenderObject, Vertex as MyVertex},
+    Queues,
+};
 
 mod shaders {
     vulkano_shaders::shader! {
@@ -53,12 +71,13 @@ pub struct Renderer {
     queues: Queues,
 
     swapchain: Arc<Swapchain>,
-    _swapchain_images: Vec<Arc<SwapchainImage>>,
-    _swapchain_image_views: Vec<Arc<ImageView<SwapchainImage>>>,
+    _swapchain_images: Vec<Arc<Image>>,
+    _swapchain_image_views: Vec<Arc<ImageView>>,
 
     render_pass: Arc<RenderPass>,
     framebuffers: Vec<Arc<Framebuffer>>,
     graphic_pipeline: Arc<GraphicsPipeline>,
+    _pipeline_layout: Arc<PipelineLayout>,
 
     command_buffer_allocator: StandardCommandBufferAllocator,
 }
@@ -84,11 +103,12 @@ impl Renderer {
         let framebuffers =
             Self::create_framebuffers(&render_pass, &swapchain, &swapchain_image_views);
 
-        let graphic_pipeline = Self::create_graphic_pipeline(device, &swapchain, &render_pass);
+        let (graphic_pipeline, pipeline_layout) =
+            Self::create_graphic_pipeline(device, &swapchain, &render_pass);
 
         let command_buffer_allocator = Self::create_command_buffer_allocator(device);
 
-        Renderer {
+        Self {
             _device: device.clone(),
             queues,
 
@@ -99,17 +119,18 @@ impl Renderer {
             render_pass,
             framebuffers,
             graphic_pipeline,
+            _pipeline_layout: pipeline_layout,
 
             command_buffer_allocator,
         }
     }
 
-    pub fn draw_frame(&self) {
+    pub fn draw_frame(&self, render_object: &RenderObject) {
         let (image_index, _suboptimal, acquire_future) =
             swapchain::acquire_next_image(self.swapchain.clone(), None)
                 .expect("Failed to acquire next image");
 
-        let command_buffer = self.record_draw_command_buffer(image_index as usize);
+        let command_buffer = self.record_draw_command_buffer(image_index as usize, render_object);
 
         let _ = acquire_future
             .then_execute(self.queues.graphic_queue.clone(), command_buffer)
@@ -183,7 +204,7 @@ impl Renderer {
         surface: &Arc<Surface>,
         window: &Arc<Window>,
         queues: &Queues,
-    ) -> (Arc<Swapchain>, Vec<Arc<SwapchainImage>>) {
+    ) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
         let physical_device = device.physical_device();
 
         let surface_info = SurfaceInfo {
@@ -196,7 +217,7 @@ impl Renderer {
             .expect("Failed to get surface capabilities");
 
         let available_formats = physical_device
-            .surface_formats(surface.as_ref(), surface_info)
+            .surface_formats(surface.as_ref(), surface_info.clone())
             .expect("Failed to get surface formats");
 
         let (format, color_space) = Self::choose_swapchain_format(available_formats);
@@ -211,14 +232,14 @@ impl Renderer {
         };
 
         let available_present_modes = physical_device
-            .surface_present_modes(surface.as_ref())
+            .surface_present_modes(surface.as_ref(), surface_info)
             .expect("Failed to get supported present modes")
             .collect();
         let present_mode = Self::choose_present_mode(available_present_modes);
 
         let swapchain_info = SwapchainCreateInfo {
             min_image_count: Self::get_minimum_image_count(&surface_capabilities),
-            image_format: Some(format),
+            image_format: format,
             image_color_space: color_space,
             image_extent: extent,
             image_array_layers: 1,
@@ -237,14 +258,14 @@ impl Renderer {
 
     fn create_swapchain_image_views(
         swapchain: &Arc<Swapchain>,
-        swapchain_images: &Vec<Arc<SwapchainImage>>,
-    ) -> Vec<Arc<ImageView<SwapchainImage>>> {
+        swapchain_images: &Vec<Arc<Image>>,
+    ) -> Vec<Arc<ImageView>> {
         let mut image_views = Vec::new();
 
         for image in swapchain_images.iter() {
             let view_info = ImageViewCreateInfo {
                 view_type: ImageViewType::Dim2d,
-                format: Some(swapchain.image_format()),
+                format: swapchain.image_format(),
                 component_mapping: ComponentMapping::identity(),
                 subresource_range: ImageSubresourceRange {
                     aspects: ImageAspects::COLOR,
@@ -266,7 +287,7 @@ impl Renderer {
     fn create_framebuffers(
         render_pass: &Arc<RenderPass>,
         swapchain: &Arc<Swapchain>,
-        image_views: &Vec<Arc<ImageView<SwapchainImage>>>,
+        image_views: &Vec<Arc<ImageView>>,
     ) -> Vec<Arc<Framebuffer>> {
         let mut framebuffers = Vec::new();
 
@@ -289,12 +310,12 @@ impl Renderer {
 
     fn create_render_pass(device: &Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<RenderPass> {
         let color_attachment = AttachmentDescription {
-            format: Some(swapchain.image_format()),
+            format: swapchain.image_format(),
             samples: SampleCount::Sample1,
-            load_op: LoadOp::Clear,
-            store_op: StoreOp::Store,
-            stencil_load_op: LoadOp::DontCare,
-            stencil_store_op: StoreOp::DontCare,
+            load_op: AttachmentLoadOp::Clear,
+            store_op: AttachmentStoreOp::Store,
+            stencil_load_op: Some(AttachmentLoadOp::DontCare),
+            stencil_store_op: Some(AttachmentStoreOp::DontCare),
             initial_layout: ImageLayout::Undefined,
             final_layout: ImageLayout::PresentSrc,
             ..Default::default()
@@ -326,40 +347,101 @@ impl Renderer {
         RenderPass::new(device.clone(), render_pass_info).expect("Failed to create render pass")
     }
 
+    fn create_pipeline_layout(device: &Arc<Device>) -> Arc<PipelineLayout> {
+        let layout_info = PipelineLayoutCreateInfo {
+            flags: PipelineLayoutCreateFlags::empty(),
+            set_layouts: Vec::new(),
+            push_constant_ranges: Vec::new(),
+            ..Default::default()
+        };
+
+        PipelineLayout::new(device.clone(), layout_info).expect("Failed to create pipeline layout")
+    }
+
     fn create_graphic_pipeline(
         device: &Arc<Device>,
         swapchain: &Arc<Swapchain>,
         render_pass: &Arc<RenderPass>,
-    ) -> Arc<GraphicsPipeline> {
-        let vertex_shader =
-            shaders::load_vertex(device.clone()).expect("Failed to load vertex shader");
-        let fragment_shader =
-            shaders::load_fragment(device.clone()).expect("Failed to load fragment shader");
+    ) -> (Arc<GraphicsPipeline>, Arc<PipelineLayout>) {
+        let vertex_shader = shaders::load_vertex(device.clone())
+            .expect("Failed to load vertex shader")
+            .entry_point("main")
+            .unwrap();
+        let fragment_shader = shaders::load_fragment(device.clone())
+            .expect("Failed to load fragment shader")
+            .entry_point("main")
+            .unwrap();
 
         let window_dimensions = swapchain.image_extent();
         let window_dimensions_f32 = [window_dimensions[0] as f32, window_dimensions[1] as f32];
 
-        let viewport = ViewportState::Fixed {
-            data: vec![(
-                Viewport {
-                    origin: [0.0, 0.0],
-                    dimensions: window_dimensions_f32,
-                    depth_range: (0.0)..(1.0),
-                },
-                Scissor {
-                    origin: [0, 0],
-                    dimensions: window_dimensions,
-                },
-            )],
+        let viewport = ViewportState {
+            viewports: smallvec![Viewport {
+                offset: [0.0, 0.0],
+                extent: window_dimensions_f32,
+                depth_range: 0.0..=1.0,
+            }],
+            scissors: smallvec![Scissor {
+                offset: [0, 0],
+                extent: window_dimensions
+            }],
+            ..Default::default()
         };
 
-        GraphicsPipeline::start()
-            .vertex_shader(vertex_shader.entry_point("main").unwrap(), ())
-            .fragment_shader(fragment_shader.entry_point("main").unwrap(), ())
-            .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
-            .viewport_state(viewport)
-            .build(device.clone())
-            .expect("Failed to build graphics pipeline")
+        let vertex_input_state = MyVertex::per_vertex()
+            .definition(&vertex_shader.info().input_interface)
+            .expect("Failed to get vertex input state");
+
+        let pipeline_layout = Self::create_pipeline_layout(device);
+
+        let pipeline_info = GraphicsPipelineCreateInfo {
+            flags: PipelineCreateFlags::empty(),
+            stages: smallvec![
+                PipelineShaderStageCreateInfo::new(vertex_shader),
+                PipelineShaderStageCreateInfo::new(fragment_shader),
+            ],
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::TriangleList,
+                primitive_restart_enable: false,
+                ..Default::default()
+            }),
+            tessellation_state: None,
+            viewport_state: Some(viewport),
+            rasterization_state: Some(RasterizationState {
+                depth_clamp_enable: false,
+                rasterizer_discard_enable: false,
+                polygon_mode: PolygonMode::Fill,
+                cull_mode: CullMode::Back,
+                front_face: FrontFace::Clockwise,
+                depth_bias: None,
+                line_width: 1.0,
+                line_rasterization_mode: LineRasterizationMode::Default,
+                line_stipple: None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            depth_stencil_state: None,
+            color_blend_state: Some(ColorBlendState {
+                flags: ColorBlendStateFlags::empty(),
+                logic_op: None,
+                attachments: vec![ColorBlendAttachmentState {
+                    blend: None,
+                    color_write_mask: ColorComponents::all(),
+                    color_write_enable: true,
+                }],
+                blend_constants: [0.0; 4],
+                ..Default::default()
+            }),
+            subpass: Some(Subpass::from(render_pass.clone(), 0).unwrap().into()),
+            discard_rectangle_state: None,
+            ..GraphicsPipelineCreateInfo::layout(pipeline_layout.clone())
+        };
+
+        let pipeline = GraphicsPipeline::new(device.clone(), None, pipeline_info)
+            .expect("Failed to create graphic pipeline");
+
+        (pipeline, pipeline_layout)
     }
 
     fn create_command_buffer_allocator(device: &Arc<Device>) -> StandardCommandBufferAllocator {
@@ -372,13 +454,26 @@ impl Renderer {
         StandardCommandBufferAllocator::new(device.clone(), allocator_info)
     }
 
-    fn record_draw_command_buffer(&self, image_index: usize) -> PrimaryAutoCommandBuffer {
+    fn record_draw_command_buffer(
+        &self,
+        image_index: usize,
+        render_object: &RenderObject,
+    ) -> Arc<PrimaryAutoCommandBuffer> {
         let render_pass_begin_info = RenderPassBeginInfo {
             render_pass: self.render_pass.clone(),
             render_area_offset: [0, 0],
             render_area_extent: self.swapchain.image_extent(),
             clear_values: vec![Some(ClearValue::Float([0.0, 0.0, 0.0, 1.0]))],
             ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index].clone())
+        };
+
+        let subpass_begin_info = SubpassBeginInfo {
+            contents: SubpassContents::Inline,
+            ..Default::default()
+        };
+
+        let subpass_end_info = SubpassEndInfo {
+            ..Default::default()
         };
 
         let mut builder = AutoCommandBufferBuilder::primary(
@@ -388,13 +483,21 @@ impl Renderer {
         )
         .expect("Failed to start recording command buffer");
 
+        let vertex_buffer = render_object.vectex_buffer();
+        let index_buffer = render_object.index_buffer();
+
         builder
-            .begin_render_pass(render_pass_begin_info, SubpassContents::Inline)
+            .begin_render_pass(render_pass_begin_info, subpass_begin_info)
             .expect("Failed to begin render pass command")
             .bind_pipeline_graphics(self.graphic_pipeline.clone())
-            .draw(3, 1, 0, 0)
+            .expect("Failed to bind graphics pipeline")
+            .bind_vertex_buffers(0, vertex_buffer.clone())
+            .expect("Failed to bind vertex buffer")
+            .bind_index_buffer(index_buffer.clone())
+            .expect("Failed to bind index buffer")
+            .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
             .expect("Failed draw command")
-            .end_render_pass()
+            .end_render_pass(subpass_end_info)
             .expect("Failed end render pass command");
 
         let command_buffer = builder.build().expect("Failed to build command buffer");

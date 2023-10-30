@@ -6,7 +6,10 @@ use vulkano::{
         QueueCreateInfo, QueueFlags,
     },
     instance::{
-        debug::{DebugUtilsMessenger, DebugUtilsMessengerCreateInfo, ValidationFeatureEnable},
+        debug::{
+            DebugUtilsMessenger, DebugUtilsMessengerCallback, DebugUtilsMessengerCreateInfo,
+            ValidationFeatureEnable,
+        },
         Instance, InstanceCreateInfo, InstanceExtensions,
     },
     library::VulkanLibrary,
@@ -20,6 +23,7 @@ use winit::{
 
 use self::renderer::Renderer;
 
+pub mod render_object;
 pub mod renderer;
 
 const REQUIRED_VALIDATION_LAYERS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
@@ -56,7 +60,7 @@ impl Engine {
         let instance = Self::create_instance();
         let debug_messenger = Self::create_debug_messenger(&instance);
 
-        let event_loop = EventLoop::new();
+        let event_loop = EventLoop::new().expect("Failed to create event loop");
         let (window, surface) = Self::create_window(&instance, &event_loop);
 
         let (device, queues) = Self::create_logical_device(&instance, &surface);
@@ -83,6 +87,10 @@ impl Engine {
         Renderer::new(&self.device, &self.surface, &self.window, &self.queues)
     }
 
+    pub fn device(&self) -> Arc<Device> {
+        self.device.clone()
+    }
+
     fn create_instance() -> Arc<Instance> {
         let library = VulkanLibrary::new().expect("Failed to load vulkan library");
 
@@ -90,7 +98,7 @@ impl Engine {
         enabled_extensions.ext_validation_features = true;
         enabled_extensions.ext_debug_utils = true;
         enabled_extensions.khr_xcb_surface = true;
-        enabled_extensions.khr_surface = true;
+        enabled_extensions.khr_xlib_surface = true;
 
         let layer_properties = library
             .layer_properties()
@@ -118,7 +126,6 @@ impl Engine {
                 patch: 0,
             },
             max_api_version: Some(Version::HEADER_VERSION),
-            enumerate_portability: false,
             enabled_validation_features: vec![ValidationFeatureEnable::DebugPrintf],
             disabled_validation_features: vec![],
             ..Default::default()
@@ -128,14 +135,16 @@ impl Engine {
     }
 
     fn create_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
-        let messenger_info = DebugUtilsMessengerCreateInfo::user_callback(Arc::new(|message| {
-            println!("Debug callback: {:?}", message.description);
-        }));
+        let messenger_info = unsafe {
+            DebugUtilsMessengerCreateInfo::user_callback(DebugUtilsMessengerCallback::new(
+                |_message_severity, _message_type, callback_data| {
+                    println!("[Debug messenger]: {:?}", callback_data.message);
+                },
+            ))
+        };
 
-        unsafe {
-            DebugUtilsMessenger::new(instance.clone(), messenger_info)
-                .expect("Failed to create debug messenger")
-        }
+        DebugUtilsMessenger::new(instance.clone(), messenger_info)
+            .expect("Failed to create debug messenger")
     }
 
     fn create_window(
@@ -150,7 +159,7 @@ impl Engine {
 
         let window = Arc::new(window);
 
-        let surface = vulkano_win::create_surface_from_winit(window.clone(), instance.clone())
+        let surface = Surface::from_window(instance.clone(), window.clone())
             .expect("Failed to create window surface");
 
         (window, surface)

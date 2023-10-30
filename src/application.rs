@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
-use winit::{event::Event, event_loop::EventLoop, window::Window};
+use winit::{
+    event::Event,
+    event_loop::{ControlFlow, EventLoop},
+    window::Window,
+};
 
 use crate::engine::Engine;
 
 pub trait Runable {
-    fn on_update(&self, event: Event<'_, ()>, window: &Arc<Window>, frame_info: FrameInfo) -> bool;
+    fn on_update(&self, event: Event<()>, window: &Arc<Window>, frame_info: FrameInfo) -> bool;
 }
 
 #[derive(Clone, Copy)]
@@ -46,15 +50,17 @@ where
         let event_loop = self.event_loop.unwrap();
         self.event_loop = None;
 
-        event_loop.run(move |event, _, control_flow| {
-            control_flow.set_poll();
+        event_loop.set_control_flow(ControlFlow::Poll);
 
+        if let Ok(_) = event_loop.run(move |event, elwt| {
             if !self
                 .runable
                 .on_update(event, self.engine.get_window(), frame_info)
             {
-                control_flow.set_exit();
+                elwt.exit();
             }
-        })
+        }) {
+            ();
+        }
     }
 }
