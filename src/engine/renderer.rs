@@ -1,19 +1,31 @@
 use std::sync::Arc;
+use std::{collections::BTreeMap, f32::consts::PI};
 
 use smallvec::smallvec;
 
+use vulkano::buffer::Buffer;
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::{
+    buffer::{BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
         AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
     },
+    descriptor_set::layout::{
+        DescriptorBindingFlags, DescriptorSetLayout, DescriptorSetLayoutBinding,
+        DescriptorSetLayoutCreateFlags, DescriptorSetLayoutCreateInfo, DescriptorType,
+    },
     device::Device,
+    device::Queue,
     format::{ClearValue, Format},
     image::{
         sampler::ComponentMapping,
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
         Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount,
+    },
+    memory::allocator::{
+        AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter, StandardMemoryAllocator,
     },
     pipeline::{
         graphics::{
@@ -30,24 +42,29 @@ use vulkano::{
             GraphicsPipelineCreateInfo,
         },
         layout::{PipelineLayoutCreateFlags, PipelineLayoutCreateInfo},
-        GraphicsPipeline, PipelineCreateFlags, PipelineLayout, PipelineShaderStageCreateInfo,
+        GraphicsPipeline, PipelineBindPoint, PipelineCreateFlags, PipelineLayout,
+        PipelineShaderStageCreateInfo,
     },
     render_pass::{
         AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp,
         Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass,
         SubpassDescription,
     },
+    shader::ShaderStages,
     swapchain::{
-        self, ColorSpace, CompositeAlpha, FullScreenExclusive, PresentMode, Surface,
-        SurfaceCapabilities, SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
+        self, ColorSpace, CompositeAlpha, FullScreenExclusive, PresentMode, SurfaceCapabilities,
+        SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
     },
     sync::{GpuFuture, Sharing},
 };
+
 use winit::window::Window;
+
+use glam::{Mat4, Vec3};
 
 use super::{
     render_object::{RenderObject, Vertex as MyVertex},
-    Queues,
+    Engine,
 };
 
 mod shaders {
@@ -66,9 +83,18 @@ mod shaders {
     }
 }
 
+#[derive(BufferContents)]
+#[repr(C)]
+struct MVP {
+    model: Mat4,
+    view: Mat4,
+    projection: Mat4,
+}
+
 pub struct Renderer {
     _device: Arc<Device>,
-    queues: Queues,
+    graphics_queue: Arc<Queue>,
+    present_queue: Arc<Queue>,
 
     swapchain: Arc<Swapchain>,
     _swapchain_images: Vec<Arc<Image>>,
@@ -77,40 +103,39 @@ pub struct Renderer {
     render_pass: Arc<RenderPass>,
     framebuffers: Vec<Arc<Framebuffer>>,
     graphic_pipeline: Arc<GraphicsPipeline>,
-    _pipeline_layout: Arc<PipelineLayout>,
+    pipeline_layout: Arc<PipelineLayout>,
 
     command_buffer_allocator: StandardCommandBufferAllocator,
+
+    mvp_buffer: Subbuffer<[MVP]>,
 }
 
 impl Renderer {
-    pub(crate) fn new(
-        device: &Arc<Device>,
-        surface: &Arc<Surface>,
-        window: &Arc<Window>,
-        queues: &Queues,
-    ) -> Self {
-        let queues = Queues {
-            graphic_queue: queues.graphic_queue.clone(),
-            present_queue: queues.present_queue.clone(),
-        };
+    pub(crate) fn new(engine: &Engine) -> Self {
+        let device = engine.device();
 
-        let (swapchain, swapchain_images) =
-            Self::create_swapchain(device, surface, window, &queues);
+        let graphics_queue = engine.graphics_queue();
+        let present_queue = engine.present_queue();
+
+        let (swapchain, swapchain_images) = Self::create_swapchain(engine);
         let swapchain_image_views =
             Self::create_swapchain_image_views(&swapchain, &swapchain_images);
 
-        let render_pass = Self::create_render_pass(device, &swapchain);
+        let render_pass = Self::create_render_pass(&device, &swapchain);
         let framebuffers =
             Self::create_framebuffers(&render_pass, &swapchain, &swapchain_image_views);
 
         let (graphic_pipeline, pipeline_layout) =
-            Self::create_graphic_pipeline(device, &swapchain, &render_pass);
+            Self::create_graphic_pipeline(&device, &swapchain, &render_pass);
 
-        let command_buffer_allocator = Self::create_command_buffer_allocator(device);
+        let mvp_buffer = Self::create_mvp_buffer(&engine.standard_memory_allocator());
+
+        let command_buffer_allocator = Self::create_command_buffer_allocator(&device);
 
         Self {
             _device: device.clone(),
-            queues,
+            graphics_queue,
+            present_queue,
 
             swapchain,
             _swapchain_images: swapchain_images,
@@ -119,9 +144,10 @@ impl Renderer {
             render_pass,
             framebuffers,
             graphic_pipeline,
-            _pipeline_layout: pipeline_layout,
+            pipeline_layout,
 
             command_buffer_allocator,
+            mvp_buffer,
         }
     }
 
@@ -133,10 +159,10 @@ impl Renderer {
         let command_buffer = self.record_draw_command_buffer(image_index as usize, render_object);
 
         let _ = acquire_future
-            .then_execute(self.queues.graphic_queue.clone(), command_buffer)
+            .then_execute(self.graphics_queue.clone(), command_buffer)
             .expect("Failed to execute draw command buffer")
             .then_swapchain_present(
-                self.queues.present_queue.clone(),
+                self.present_queue.clone(),
                 SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index),
             )
             .then_signal_fence_and_flush()
@@ -199,18 +225,16 @@ impl Renderer {
         PresentMode::Fifo
     }
 
-    fn create_swapchain(
-        device: &Arc<Device>,
-        surface: &Arc<Surface>,
-        window: &Arc<Window>,
-        queues: &Queues,
-    ) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
+    fn create_swapchain(engine: &Engine) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
+        let device = engine.device();
         let physical_device = device.physical_device();
 
         let surface_info = SurfaceInfo {
             full_screen_exclusive: FullScreenExclusive::Default,
             ..Default::default()
         };
+
+        let surface = engine.window_surface();
 
         let surface_capabilities = physical_device
             .surface_capabilities(surface.as_ref(), surface_info.clone())
@@ -221,10 +245,10 @@ impl Renderer {
             .expect("Failed to get surface formats");
 
         let (format, color_space) = Self::choose_swapchain_format(available_formats);
-        let extent = Self::choose_swapchain_extent(window, &surface_capabilities);
+        let extent = Self::choose_swapchain_extent(&engine.window(), &surface_capabilities);
 
-        let sharing = if queues.graphic_queue.queue_family_index()
-            == queues.present_queue.queue_family_index()
+        let sharing = if engine.graphics_queue().queue_family_index()
+            == engine.present_queue().queue_family_index()
         {
             Sharing::Exclusive
         } else {
@@ -348,9 +372,30 @@ impl Renderer {
     }
 
     fn create_pipeline_layout(device: &Arc<Device>) -> Arc<PipelineLayout> {
+        let mut mvp_bindings = BTreeMap::new();
+        mvp_bindings.insert(
+            0,
+            DescriptorSetLayoutBinding {
+                binding_flags: DescriptorBindingFlags::empty(),
+                descriptor_count: 1,
+                stages: ShaderStages::VERTEX,
+                immutable_samplers: Vec::new(),
+                ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+            },
+        );
+
+        let mvp_info = DescriptorSetLayoutCreateInfo {
+            flags: DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR,
+            bindings: mvp_bindings,
+            ..Default::default()
+        };
+
+        let mvp_descriptor_set = DescriptorSetLayout::new(device.clone(), mvp_info)
+            .expect("Failed to create descriptor set layout");
+
         let layout_info = PipelineLayoutCreateInfo {
             flags: PipelineLayoutCreateFlags::empty(),
-            set_layouts: Vec::new(),
+            set_layouts: vec![mvp_descriptor_set],
             push_constant_ranges: Vec::new(),
             ..Default::default()
         };
@@ -454,6 +499,36 @@ impl Renderer {
         StandardCommandBufferAllocator::new(device.clone(), allocator_info)
     }
 
+    fn create_mvp_buffer(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[MVP]> {
+        let buffer_info = BufferCreateInfo {
+            sharing: Sharing::Exclusive, // TODO: handle sharing accross different queues
+            usage: BufferUsage::UNIFORM_BUFFER,
+            ..Default::default()
+        };
+
+        let allocation_info = AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            allocate_preference: MemoryAllocatePreference::Unknown,
+            ..Default::default()
+        };
+
+        let mut mvp = MVP {
+            model: Mat4::IDENTITY,
+            view: Mat4::look_to_rh(
+                Vec3::new(0.0, 1.0, 3.0),
+                Vec3::new(0.0, -0.2, -1.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ),
+            projection: Mat4::perspective_rh(f32::to_radians(45.0), 800.0 / 600.0, 0.1, 100.0),
+        };
+
+        mvp.projection.as_mut()[1 * 4 + 1] *= -1.0;
+
+        Buffer::from_iter(allocator.clone(), buffer_info, allocation_info, [mvp])
+            .expect("Failed to create mvp buffer")
+    }
+
     fn record_draw_command_buffer(
         &self,
         image_index: usize,
@@ -478,7 +553,7 @@ impl Renderer {
 
         let mut builder = AutoCommandBufferBuilder::primary(
             &self.command_buffer_allocator,
-            self.queues.graphic_queue.queue_family_index(),
+            self.graphics_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .expect("Failed to start recording command buffer");
@@ -495,6 +570,8 @@ impl Renderer {
             .expect("Failed to bind vertex buffer")
             .bind_index_buffer(index_buffer.clone())
             .expect("Failed to bind index buffer")
+            .push_descriptor_set(PipelineBindPoint::Graphics, self.pipeline_layout.clone(), 0, smallvec![WriteDescriptorSet::buffer(0, self.mvp_buffer.clone())])
+            .expect("Failed to bind descriptor set")
             .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
             .expect("Failed draw command")
             .end_render_pass(subpass_end_info)

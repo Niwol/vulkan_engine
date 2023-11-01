@@ -2,9 +2,8 @@ use std::sync::Arc;
 
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
-    device::Device,
     memory::allocator::{
-        AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter, StandardMemoryAllocator,
+        AllocationCreateInfo, MemoryAllocatePreference, MemoryAllocator, MemoryTypeFilter,
     },
     pipeline::graphics::vertex_input,
     sync::Sharing,
@@ -26,9 +25,11 @@ pub struct RenderObject {
 }
 
 impl RenderObject {
-    pub fn new(device: &Arc<Device>, vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
-        let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
-
+    pub fn new(
+        allocator: Arc<dyn MemoryAllocator>,
+        vertices: Vec<Vertex>,
+        indices: Vec<u32>,
+    ) -> Self {
         let buffer_info = BufferCreateInfo {
             sharing: Sharing::Exclusive, // TODO: handle sharing across different queues
             usage: BufferUsage::VERTEX_BUFFER,

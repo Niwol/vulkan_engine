@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use winit::{
-    event::Event,
+    event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::Window,
 };
@@ -53,9 +53,17 @@ where
         event_loop.set_control_flow(ControlFlow::Poll);
 
         if let Ok(_) = event_loop.run(move |event, elwt| {
+            if let Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } = event
+            {
+                elwt.exit();
+            }
+
             if !self
                 .runable
-                .on_update(event, self.engine.get_window(), frame_info)
+                .on_update(event, self.engine.window(), frame_info)
             {
                 elwt.exit();
             }

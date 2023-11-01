@@ -13,6 +13,7 @@ use vulkano::{
         Instance, InstanceCreateInfo, InstanceExtensions,
     },
     library::VulkanLibrary,
+    memory::allocator::StandardMemoryAllocator,
     swapchain::Surface,
     Version,
 };
@@ -33,11 +34,6 @@ struct QueueFamilyIndices {
     present_family: Option<u32>,
 }
 
-pub(crate) struct Queues {
-    graphic_queue: Arc<Queue>,
-    present_queue: Arc<Queue>,
-}
-
 pub struct Engine {
     _vulkan_instance: Arc<Instance>,
     _debug_messenger: DebugUtilsMessenger,
@@ -46,7 +42,10 @@ pub struct Engine {
     surface: Arc<Surface>,
 
     device: Arc<Device>,
-    queues: Queues,
+    graphics_queue: Arc<Queue>,
+    present_queue: Arc<Queue>,
+
+    standard_memory_allocator: Arc<StandardMemoryAllocator>,
 }
 
 impl QueueFamilyIndices {
@@ -63,7 +62,11 @@ impl Engine {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let (window, surface) = Self::create_window(&instance, &event_loop);
 
-        let (device, queues) = Self::create_logical_device(&instance, &surface);
+        let (device, graphics_queue, present_queue) =
+            Self::create_logical_device(&instance, &surface);
+
+        let standard_memory_allocator =
+            Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
         let engine = Self {
             _vulkan_instance: instance,
@@ -73,22 +76,41 @@ impl Engine {
             surface,
 
             device,
-            queues,
+            graphics_queue,
+            present_queue,
+
+            standard_memory_allocator,
         };
 
         (engine, event_loop)
     }
 
-    pub(crate) fn get_window(&self) -> &Arc<Window> {
-        &self.window
-    }
-
     pub fn create_renderer(&self) -> Renderer {
-        Renderer::new(&self.device, &self.surface, &self.window, &self.queues)
+        Renderer::new(self)
     }
 
     pub fn device(&self) -> Arc<Device> {
         self.device.clone()
+    }
+
+    pub fn graphics_queue(&self) -> Arc<Queue> {
+        self.graphics_queue.clone()
+    }
+
+    pub fn present_queue(&self) -> Arc<Queue> {
+        self.present_queue.clone()
+    }
+
+    pub fn standard_memory_allocator(&self) -> Arc<StandardMemoryAllocator> {
+        self.standard_memory_allocator.clone()
+    }
+
+    pub(crate) fn window(&self) -> &Arc<Window> {
+        &self.window
+    }
+
+    pub(crate) fn window_surface(&self) -> Arc<Surface> {
+        self.surface.clone()
     }
 
     fn create_instance() -> Arc<Instance> {
@@ -218,11 +240,12 @@ impl Engine {
     fn create_logical_device(
         instance: &Arc<Instance>,
         surface: &Arc<Surface>,
-    ) -> (Arc<Device>, Queues) {
+    ) -> (Arc<Device>, Arc<Queue>, Arc<Queue>) {
         let physical_device = Self::choose_physical_device(instance, surface);
 
         let mut enabled_extensions = DeviceExtensions::empty();
         enabled_extensions.khr_swapchain = true;
+        enabled_extensions.khr_push_descriptor = true;
 
         let enabled_features = Features::empty();
 
@@ -250,15 +273,10 @@ impl Engine {
         match Device::new(physical_device, device_info) {
             Ok((device, queues)) => {
                 let mut queues = queues.into_iter();
-                let graphic_queue = queues.next().unwrap();
-                let present_queue = queues.next().unwrap_or(graphic_queue.clone());
+                let graphics_queue = queues.next().unwrap();
+                let present_queue = queues.next().unwrap_or(graphics_queue.clone());
 
-                let queues = Queues {
-                    graphic_queue,
-                    present_queue,
-                };
-
-                (device, queues)
+                (device, graphics_queue, present_queue)
             }
             Err(error) => panic!("Failed to create logical device: {:?}", error),
         }
