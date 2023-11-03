@@ -66,7 +66,7 @@ use winit::window::Window;
 use glam::{Mat4, Vec3};
 
 use super::{
-    render_object::{RenderObject, Vertex as MyVertex},
+    mesh::{Mesh, Vertex as MyVertex},
     Engine,
 };
 
@@ -169,12 +169,12 @@ impl Renderer {
         }
     }
 
-    pub fn draw_frame(&self, render_object: &RenderObject) {
+    pub fn draw_frame(&self, mesh: &Mesh) {
         let (image_index, _suboptimal, acquire_future) =
             swapchain::acquire_next_image(self.swapchain.clone(), None)
                 .expect("Failed to acquire next image");
 
-        let command_buffer = self.record_draw_command_buffer(image_index as usize, render_object);
+        let command_buffer = self.record_draw_command_buffer(image_index as usize, mesh);
 
         let _ = acquire_future
             .then_execute(self.graphics_queue.clone(), command_buffer)
@@ -190,7 +190,7 @@ impl Renderer {
     fn record_draw_command_buffer(
         &self,
         image_index: usize,
-        render_object: &RenderObject,
+        mesh: &Mesh,
     ) -> Arc<PrimaryAutoCommandBuffer> {
         let render_pass_begin_info = RenderPassBeginInfo {
             render_pass: self.render_pass.clone(),
@@ -216,8 +216,8 @@ impl Renderer {
         )
         .expect("Failed to start recording command buffer");
 
-        let vertex_buffer = render_object.vectex_buffer();
-        let index_buffer = render_object.index_buffer();
+        let vertex_buffer = mesh.vectex_buffer();
+        let index_buffer = mesh.index_buffer();
 
         builder
             .begin_render_pass(render_pass_begin_info, subpass_begin_info)

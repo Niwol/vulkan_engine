@@ -1,6 +1,6 @@
-use vulkano::buffer::BufferContents;
+use glam::Vec3;
 use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
+    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     memory::allocator::{AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter},
     pipeline::graphics::vertex_input,
     sync::Sharing,
@@ -8,58 +8,68 @@ use vulkano::{
 
 use super::Engine;
 
+pub mod primitives;
+
 #[derive(BufferContents, vertex_input::Vertex)]
 #[repr(C)]
 pub struct Vertex {
     #[format(R32G32B32_SFLOAT)]
-    pub in_position: [f32; 3],
+    pub in_position: Vec3,
 
     #[format(R32G32B32_SFLOAT)]
-    pub in_color: [f32; 3],
+    pub in_color: Vec3,
 }
 
-pub struct RenderObject {
+pub struct Mesh {
     vertex_buffer: Subbuffer<[Vertex]>,
     index_buffer: Subbuffer<[u32]>,
 }
 
-impl RenderObject {
+impl Mesh {
     pub fn new(engine: &Engine, vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
-        let buffer_info = BufferCreateInfo {
+        let allocator = engine.vulkan().standard_memory_allocator();
+
+        let vertex_buffer_info = BufferCreateInfo {
             sharing: Sharing::Exclusive, // TODO: handle sharing across different queues
             usage: BufferUsage::VERTEX_BUFFER,
             ..Default::default()
         };
 
-        let allocation_info = AllocationCreateInfo {
+        let vertex_allocation_info = AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             allocate_preference: MemoryAllocatePreference::Unknown,
             ..Default::default()
         };
 
-        let allocator = engine.vulkan().standard_memory_allocator();
+        let vertex_buffer = Buffer::from_iter(
+            allocator.clone(),
+            vertex_buffer_info,
+            vertex_allocation_info,
+            vertices,
+        )
+        .expect("Failed to create vertex buffer");
 
-        let vertex_buffer =
-            Buffer::from_iter(allocator.clone(), buffer_info, allocation_info, vertices)
-                .expect("Failed to create vertex buffer");
-
-        let buffer_info = BufferCreateInfo {
+        let index_buffer_info = BufferCreateInfo {
             sharing: Sharing::Exclusive, // TODO: handle sharing across different queues
             usage: BufferUsage::INDEX_BUFFER,
             ..Default::default()
         };
 
-        let allocation_info = AllocationCreateInfo {
+        let index_allocation_info = AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             allocate_preference: MemoryAllocatePreference::Unknown,
             ..Default::default()
         };
 
-        let index_buffer =
-            Buffer::from_iter(allocator.clone(), buffer_info, allocation_info, indices)
-                .expect("Failed to create index buffer");
+        let index_buffer = Buffer::from_iter(
+            allocator.clone(),
+            index_buffer_info,
+            index_allocation_info,
+            indices,
+        )
+        .expect("Failed to create index buffer");
 
         Self {
             vertex_buffer,

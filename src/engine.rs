@@ -2,7 +2,7 @@ use winit::event_loop::EventLoop;
 
 use self::renderer::Renderer;
 
-pub mod render_object;
+pub mod mesh;
 pub mod renderer;
 mod vulkan;
 

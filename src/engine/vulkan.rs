@@ -238,7 +238,8 @@ impl Vulkan {
         enabled_extensions.khr_swapchain = true;
         enabled_extensions.khr_push_descriptor = true;
 
-        let enabled_features = Features::empty();
+        let mut enabled_features = Features::empty();
+        enabled_features.fill_mode_non_solid = true;
 
         let indices = Self::find_queue_family_indices(&physical_device, surface);
         let mut unique_indices = vec![indices.graphic_family.unwrap()];
