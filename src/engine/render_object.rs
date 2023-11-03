@@ -1,13 +1,12 @@
-use std::sync::Arc;
-
+use vulkano::buffer::BufferContents;
 use vulkano::{
-    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
-    memory::allocator::{
-        AllocationCreateInfo, MemoryAllocatePreference, MemoryAllocator, MemoryTypeFilter,
-    },
+    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
+    memory::allocator::{AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter},
     pipeline::graphics::vertex_input,
     sync::Sharing,
 };
+
+use super::Engine;
 
 #[derive(BufferContents, vertex_input::Vertex)]
 #[repr(C)]
@@ -25,11 +24,7 @@ pub struct RenderObject {
 }
 
 impl RenderObject {
-    pub fn new(
-        allocator: Arc<dyn MemoryAllocator>,
-        vertices: Vec<Vertex>,
-        indices: Vec<u32>,
-    ) -> Self {
+    pub fn new(engine: &Engine, vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
         let buffer_info = BufferCreateInfo {
             sharing: Sharing::Exclusive, // TODO: handle sharing across different queues
             usage: BufferUsage::VERTEX_BUFFER,
@@ -42,6 +37,8 @@ impl RenderObject {
             allocate_preference: MemoryAllocatePreference::Unknown,
             ..Default::default()
         };
+
+        let allocator = engine.vulkan().standard_memory_allocator();
 
         let vertex_buffer =
             Buffer::from_iter(allocator.clone(), buffer_info, allocation_info, vertices)

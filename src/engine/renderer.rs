@@ -1,10 +1,13 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::{collections::BTreeMap, f32::consts::PI};
 
 use smallvec::smallvec;
 
 use vulkano::buffer::Buffer;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use vulkano::descriptor_set::allocator::{
+    StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
+};
+use vulkano::descriptor_set::{DescriptorSet, PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::{
     buffer::{BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -104,18 +107,23 @@ pub struct Renderer {
     framebuffers: Vec<Arc<Framebuffer>>,
     graphic_pipeline: Arc<GraphicsPipeline>,
     pipeline_layout: Arc<PipelineLayout>,
+    _descriptor_set_layout: Arc<DescriptorSetLayout>,
 
     command_buffer_allocator: StandardCommandBufferAllocator,
+    _descriptor_set_allocator: StandardDescriptorSetAllocator,
 
-    mvp_buffer: Subbuffer<[MVP]>,
+    _mvp_buffer: Subbuffer<[MVP]>,
+    mvp_descriptor_set: Arc<PersistentDescriptorSet>,
 }
 
 impl Renderer {
     pub(crate) fn new(engine: &Engine) -> Self {
-        let device = engine.device();
+        let vulkan = engine.vulkan();
 
-        let graphics_queue = engine.graphics_queue();
-        let present_queue = engine.present_queue();
+        let device = vulkan.device();
+
+        let graphics_queue = vulkan.graphics_queue();
+        let present_queue = vulkan.present_queue();
 
         let (swapchain, swapchain_images) = Self::create_swapchain(engine);
         let swapchain_image_views =
@@ -125,12 +133,18 @@ impl Renderer {
         let framebuffers =
             Self::create_framebuffers(&render_pass, &swapchain, &swapchain_image_views);
 
-        let (graphic_pipeline, pipeline_layout) =
+        let (graphic_pipeline, pipeline_layout, descriptor_set_layout) =
             Self::create_graphic_pipeline(&device, &swapchain, &render_pass);
 
-        let mvp_buffer = Self::create_mvp_buffer(&engine.standard_memory_allocator());
-
         let command_buffer_allocator = Self::create_command_buffer_allocator(&device);
+        let descriptor_set_allocator = Self::create_descriptor_set_allocator(&device);
+
+        let mvp_buffer = Self::create_mvp_buffer(&vulkan.standard_memory_allocator());
+        let mvp_descriptor_set = Self::create_mvp_descriptor_set(
+            &descriptor_set_allocator,
+            &descriptor_set_layout,
+            &mvp_buffer,
+        );
 
         Self {
             _device: device.clone(),
@@ -145,9 +159,13 @@ impl Renderer {
             framebuffers,
             graphic_pipeline,
             pipeline_layout,
+            _descriptor_set_layout: descriptor_set_layout,
 
             command_buffer_allocator,
-            mvp_buffer,
+            _descriptor_set_allocator: descriptor_set_allocator,
+
+            _mvp_buffer: mvp_buffer,
+            mvp_descriptor_set,
         }
     }
 
@@ -167,6 +185,64 @@ impl Renderer {
             )
             .then_signal_fence_and_flush()
             .expect("Failed to signal fence");
+    }
+
+    fn record_draw_command_buffer(
+        &self,
+        image_index: usize,
+        render_object: &RenderObject,
+    ) -> Arc<PrimaryAutoCommandBuffer> {
+        let render_pass_begin_info = RenderPassBeginInfo {
+            render_pass: self.render_pass.clone(),
+            render_area_offset: [0, 0],
+            render_area_extent: self.swapchain.image_extent(),
+            clear_values: vec![Some(ClearValue::Float([0.0, 0.0, 0.0, 1.0]))],
+            ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index].clone())
+        };
+
+        let subpass_begin_info = SubpassBeginInfo {
+            contents: SubpassContents::Inline,
+            ..Default::default()
+        };
+
+        let subpass_end_info = SubpassEndInfo {
+            ..Default::default()
+        };
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            &self.command_buffer_allocator,
+            self.graphics_queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .expect("Failed to start recording command buffer");
+
+        let vertex_buffer = render_object.vectex_buffer();
+        let index_buffer = render_object.index_buffer();
+
+        builder
+            .begin_render_pass(render_pass_begin_info, subpass_begin_info)
+            .expect("Failed to begin render pass command")
+            .bind_pipeline_graphics(self.graphic_pipeline.clone())
+            .expect("Failed to bind graphics pipeline")
+            .bind_vertex_buffers(0, vertex_buffer.clone())
+            .expect("Failed to bind vertex buffer")
+            .bind_index_buffer(index_buffer.clone())
+            .expect("Failed to bind index buffer")
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                self.pipeline_layout.clone(),
+                0,
+                self.mvp_descriptor_set.clone().offsets([]),
+            )
+            .expect("Failed to bind descriptor set")
+            .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
+            .expect("Failed draw command")
+            .end_render_pass(subpass_end_info)
+            .expect("Failed end render pass command");
+
+        let command_buffer = builder.build().expect("Failed to build command buffer");
+
+        command_buffer
     }
 
     fn get_minimum_image_count(capabilities: &SurfaceCapabilities) -> u32 {
@@ -226,7 +302,9 @@ impl Renderer {
     }
 
     fn create_swapchain(engine: &Engine) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
-        let device = engine.device();
+        let vulkan = engine.vulkan();
+
+        let device = vulkan.device();
         let physical_device = device.physical_device();
 
         let surface_info = SurfaceInfo {
@@ -234,7 +312,7 @@ impl Renderer {
             ..Default::default()
         };
 
-        let surface = engine.window_surface();
+        let surface = vulkan.window_surface();
 
         let surface_capabilities = physical_device
             .surface_capabilities(surface.as_ref(), surface_info.clone())
@@ -245,10 +323,10 @@ impl Renderer {
             .expect("Failed to get surface formats");
 
         let (format, color_space) = Self::choose_swapchain_format(available_formats);
-        let extent = Self::choose_swapchain_extent(&engine.window(), &surface_capabilities);
+        let extent = Self::choose_swapchain_extent(&vulkan.window(), &surface_capabilities);
 
-        let sharing = if engine.graphics_queue().queue_family_index()
-            == engine.present_queue().queue_family_index()
+        let sharing = if vulkan.graphics_queue().queue_family_index()
+            == vulkan.present_queue().queue_family_index()
         {
             Sharing::Exclusive
         } else {
@@ -371,7 +449,9 @@ impl Renderer {
         RenderPass::new(device.clone(), render_pass_info).expect("Failed to create render pass")
     }
 
-    fn create_pipeline_layout(device: &Arc<Device>) -> Arc<PipelineLayout> {
+    fn create_pipeline_layout(
+        device: &Arc<Device>,
+    ) -> (Arc<PipelineLayout>, Arc<DescriptorSetLayout>) {
         let mut mvp_bindings = BTreeMap::new();
         mvp_bindings.insert(
             0,
@@ -385,7 +465,7 @@ impl Renderer {
         );
 
         let mvp_info = DescriptorSetLayoutCreateInfo {
-            flags: DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR,
+            flags: DescriptorSetLayoutCreateFlags::empty(),
             bindings: mvp_bindings,
             ..Default::default()
         };
@@ -395,19 +475,26 @@ impl Renderer {
 
         let layout_info = PipelineLayoutCreateInfo {
             flags: PipelineLayoutCreateFlags::empty(),
-            set_layouts: vec![mvp_descriptor_set],
+            set_layouts: vec![mvp_descriptor_set.clone()],
             push_constant_ranges: Vec::new(),
             ..Default::default()
         };
 
-        PipelineLayout::new(device.clone(), layout_info).expect("Failed to create pipeline layout")
+        let pipeline_layout = PipelineLayout::new(device.clone(), layout_info)
+            .expect("Failed to create pipeline layout");
+
+        (pipeline_layout, mvp_descriptor_set)
     }
 
     fn create_graphic_pipeline(
         device: &Arc<Device>,
         swapchain: &Arc<Swapchain>,
         render_pass: &Arc<RenderPass>,
-    ) -> (Arc<GraphicsPipeline>, Arc<PipelineLayout>) {
+    ) -> (
+        Arc<GraphicsPipeline>,
+        Arc<PipelineLayout>,
+        Arc<DescriptorSetLayout>,
+    ) {
         let vertex_shader = shaders::load_vertex(device.clone())
             .expect("Failed to load vertex shader")
             .entry_point("main")
@@ -437,7 +524,7 @@ impl Renderer {
             .definition(&vertex_shader.info().input_interface)
             .expect("Failed to get vertex input state");
 
-        let pipeline_layout = Self::create_pipeline_layout(device);
+        let (pipeline_layout, descriptor_set_layout) = Self::create_pipeline_layout(device);
 
         let pipeline_info = GraphicsPipelineCreateInfo {
             flags: PipelineCreateFlags::empty(),
@@ -486,7 +573,7 @@ impl Renderer {
         let pipeline = GraphicsPipeline::new(device.clone(), None, pipeline_info)
             .expect("Failed to create graphic pipeline");
 
-        (pipeline, pipeline_layout)
+        (pipeline, pipeline_layout, descriptor_set_layout)
     }
 
     fn create_command_buffer_allocator(device: &Arc<Device>) -> StandardCommandBufferAllocator {
@@ -529,56 +616,29 @@ impl Renderer {
             .expect("Failed to create mvp buffer")
     }
 
-    fn record_draw_command_buffer(
-        &self,
-        image_index: usize,
-        render_object: &RenderObject,
-    ) -> Arc<PrimaryAutoCommandBuffer> {
-        let render_pass_begin_info = RenderPassBeginInfo {
-            render_pass: self.render_pass.clone(),
-            render_area_offset: [0, 0],
-            render_area_extent: self.swapchain.image_extent(),
-            clear_values: vec![Some(ClearValue::Float([0.0, 0.0, 0.0, 1.0]))],
-            ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index].clone())
-        };
-
-        let subpass_begin_info = SubpassBeginInfo {
-            contents: SubpassContents::Inline,
+    fn create_descriptor_set_allocator(device: &Arc<Device>) -> StandardDescriptorSetAllocator {
+        let allocator_info = StandardDescriptorSetAllocatorCreateInfo {
+            set_count: 32,
+            update_after_bind: false,
             ..Default::default()
         };
 
-        let subpass_end_info = SubpassEndInfo {
-            ..Default::default()
-        };
+        StandardDescriptorSetAllocator::new(device.clone(), allocator_info)
+    }
 
-        let mut builder = AutoCommandBufferBuilder::primary(
-            &self.command_buffer_allocator,
-            self.graphics_queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
+    fn create_mvp_descriptor_set(
+        descriptor_set_allocator: &StandardDescriptorSetAllocator,
+        descriptor_set_layout: &Arc<DescriptorSetLayout>,
+        mvp_buffer: &Subbuffer<[MVP]>,
+    ) -> Arc<PersistentDescriptorSet> {
+        let write_descriptor = WriteDescriptorSet::buffer(0, mvp_buffer.clone());
+
+        PersistentDescriptorSet::new(
+            descriptor_set_allocator,
+            descriptor_set_layout.clone(),
+            vec![write_descriptor],
+            Vec::new(),
         )
-        .expect("Failed to start recording command buffer");
-
-        let vertex_buffer = render_object.vectex_buffer();
-        let index_buffer = render_object.index_buffer();
-
-        builder
-            .begin_render_pass(render_pass_begin_info, subpass_begin_info)
-            .expect("Failed to begin render pass command")
-            .bind_pipeline_graphics(self.graphic_pipeline.clone())
-            .expect("Failed to bind graphics pipeline")
-            .bind_vertex_buffers(0, vertex_buffer.clone())
-            .expect("Failed to bind vertex buffer")
-            .bind_index_buffer(index_buffer.clone())
-            .expect("Failed to bind index buffer")
-            .push_descriptor_set(PipelineBindPoint::Graphics, self.pipeline_layout.clone(), 0, smallvec![WriteDescriptorSet::buffer(0, self.mvp_buffer.clone())])
-            .expect("Failed to bind descriptor set")
-            .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
-            .expect("Failed draw command")
-            .end_render_pass(subpass_end_info)
-            .expect("Failed end render pass command");
-
-        let command_buffer = builder.build().expect("Failed to build command buffer");
-
-        command_buffer
+        .expect("Failed to create mvp descriptor set")
     }
 }

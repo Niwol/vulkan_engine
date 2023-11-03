@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::time::Instant;
+use std::{borrow::BorrowMut, sync::Arc};
 
 use winit::{
     event::{Event, WindowEvent},
@@ -45,14 +46,16 @@ where
     }
 
     pub fn run(mut self) {
-        let frame_info = FrameInfo { delta_time: 0.0 };
-
         let event_loop = self.event_loop.unwrap();
         self.event_loop = None;
 
         event_loop.set_control_flow(ControlFlow::Poll);
 
+        let mut delta_time = 0.0;
+
         if let Ok(_) = event_loop.run(move |event, elwt| {
+            let start = Instant::now();
+
             if let Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
@@ -61,12 +64,26 @@ where
                 elwt.exit();
             }
 
-            if !self
-                .runable
-                .on_update(event, self.engine.window(), frame_info)
-            {
+            if !self.runable.on_update(
+                event,
+                self.engine.vulkan().window(),
+                FrameInfo { delta_time },
+            ) {
                 elwt.exit();
             }
+
+            delta_time = start.elapsed().as_secs_f32();
+
+            let mut window = self.engine.vulkan().window();
+            let window = window.borrow_mut();
+            window.set_title(
+                format!(
+                    "Vulkan application -- {} ms  --  {} FPS",
+                    (delta_time * 10000.0) as i32,
+                    (1.0 / delta_time) as i32
+                )
+                .as_str(),
+            );
         }) {
             ();
         }
