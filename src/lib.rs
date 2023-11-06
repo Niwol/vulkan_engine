@@ -1,5 +1,6 @@
 pub mod application;
 
+pub mod camera;
 pub mod engine;
 
 pub use glam;

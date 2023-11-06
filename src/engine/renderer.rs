@@ -65,6 +65,8 @@ use winit::window::Window;
 
 use glam::{Mat4, Vec3};
 
+use crate::camera::Camera;
+
 use super::{
     mesh::{Mesh, Vertex as MyVertex},
     Engine,
@@ -112,7 +114,7 @@ pub struct Renderer {
     command_buffer_allocator: StandardCommandBufferAllocator,
     _descriptor_set_allocator: StandardDescriptorSetAllocator,
 
-    _mvp_buffer: Subbuffer<[MVP]>,
+    mvp_buffer: Subbuffer<[MVP]>,
     mvp_descriptor_set: Arc<PersistentDescriptorSet>,
 }
 
@@ -164,19 +166,27 @@ impl Renderer {
             command_buffer_allocator,
             _descriptor_set_allocator: descriptor_set_allocator,
 
-            _mvp_buffer: mvp_buffer,
+            mvp_buffer,
             mvp_descriptor_set,
         }
     }
 
-    pub fn draw_frame(&self, mesh: &Mesh) {
-        let (image_index, _suboptimal, acquire_future) =
+    pub fn draw_frame(&self, mesh: &Mesh, camera: &Camera) {
+        let (image_index, _suboptimal, swapchain_future) =
             swapchain::acquire_next_image(self.swapchain.clone(), None)
                 .expect("Failed to acquire next image");
 
+        let view = camera.get_view();
+        {
+            let mut buffer_write = self.mvp_buffer.write().unwrap();
+            for mvp in buffer_write.iter_mut() {
+                mvp.view = view;
+            }
+        }
+
         let command_buffer = self.record_draw_command_buffer(image_index as usize, mesh);
 
-        let _ = acquire_future
+        let _ = swapchain_future
             .then_execute(self.graphics_queue.clone(), command_buffer)
             .expect("Failed to execute draw command buffer")
             .then_swapchain_present(

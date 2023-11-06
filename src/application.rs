@@ -10,7 +10,7 @@ use winit::{
 use crate::engine::Engine;
 
 pub trait Runable {
-    fn on_update(&self, event: Event<()>, window: &Arc<Window>, frame_info: FrameInfo) -> bool;
+    fn on_update(&mut self, event: Event<()>, window: &Arc<Window>, frame_info: FrameInfo) -> bool;
 }
 
 #[derive(Clone, Copy)]
