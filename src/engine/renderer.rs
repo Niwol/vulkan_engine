@@ -65,7 +65,7 @@ use winit::window::Window;
 
 use glam::{Mat4, Vec3};
 
-use crate::camera::Camera;
+use crate::camera::Camera3D;
 
 use super::{
     mesh::{Mesh, Vertex as MyVertex},
@@ -171,7 +171,7 @@ impl Renderer {
         }
     }
 
-    pub fn draw_frame(&self, mesh: &Mesh, camera: &Camera) {
+    pub fn draw_frame(&self, mesh: &Mesh, camera: &Camera3D) {
         let (image_index, _suboptimal, swapchain_future) =
             swapchain::acquire_next_image(self.swapchain.clone(), None)
                 .expect("Failed to acquire next image");
