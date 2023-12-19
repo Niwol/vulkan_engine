@@ -5,4 +5,5 @@ pub mod engine;
 
 pub use glam;
 pub use winit;
-pub use winit_input_helper;
+
+mod vulkan_context;

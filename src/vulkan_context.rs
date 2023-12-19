@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use vulkano::{
+    command_buffer::allocator::{
+        StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
+    },
     device::{
         physical::PhysicalDevice, Device, DeviceCreateInfo, DeviceExtensions, Features, Queue,
         QueueCreateInfo, QueueFlags,
@@ -16,10 +20,7 @@ use vulkano::{
     swapchain::Surface,
     Version, VulkanLibrary,
 };
-use winit::{
-    event_loop::EventLoop,
-    window::{Window, WindowBuilder},
-};
+use winit::window::Window;
 
 const REQUIRED_VALIDATION_LAYERS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
 
@@ -28,12 +29,9 @@ struct QueueFamilyIndices {
     present_family: Option<u32>,
 }
 
-pub struct Vulkan {
+pub struct VulkanContext {
     _instance: Arc<Instance>,
     _debug_messenger: DebugUtilsMessenger,
-
-    window: Arc<Window>,
-    surface: Arc<Surface>,
 
     device: Arc<Device>,
 
@@ -41,6 +39,7 @@ pub struct Vulkan {
     present_queue: Arc<Queue>,
 
     standard_memory_allocator: Arc<StandardMemoryAllocator>,
+    standard_command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
 }
 
 impl QueueFamilyIndices {
@@ -49,63 +48,64 @@ impl QueueFamilyIndices {
     }
 }
 
-impl Vulkan {
-    pub(in crate::engine) fn new() -> (Self, EventLoop<()>) {
-        let instance = Self::create_instance();
-        let debug_messenger = Self::create_debug_messenger(&instance);
+impl VulkanContext {
+    pub(crate) fn new(window: &Arc<Window>) -> Result<Self> {
+        let instance = Self::create_instance()?;
+        let debug_messenger = Self::create_debug_messenger(&instance)?;
 
-        let event_loop = EventLoop::new().expect("Failed to create event loop");
-        let (window, surface) = Self::create_window(&instance, &event_loop);
-
+        let dummy_surface = Surface::from_window(Arc::clone(&instance), Arc::clone(window))?;
         let (device, graphics_queue, present_queue) =
-            Self::create_logical_device(&instance, &surface);
+            Self::create_logical_device(&instance, &dummy_surface)?;
 
         let standard_memory_allocator =
             Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-        let vulkan = Self {
+        let standard_command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+            Arc::clone(&device),
+            StandardCommandBufferAllocatorCreateInfo::default(),
+        ));
+
+        let vulkan_context = Self {
             _instance: instance,
             _debug_messenger: debug_messenger,
-
-            window,
-            surface,
 
             device,
             graphics_queue,
             present_queue,
 
             standard_memory_allocator,
+            standard_command_buffer_allocator,
         };
 
-        (vulkan, event_loop)
+        Ok(vulkan_context)
     }
 
-    pub fn device(&self) -> Arc<Device> {
-        self.device.clone()
+    pub fn instance(&self) -> &Arc<Instance> {
+        &self._instance
     }
 
-    pub fn graphics_queue(&self) -> Arc<Queue> {
-        self.graphics_queue.clone()
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
     }
 
-    pub fn present_queue(&self) -> Arc<Queue> {
-        self.present_queue.clone()
+    pub fn graphics_queue(&self) -> &Arc<Queue> {
+        &self.graphics_queue
     }
 
-    pub fn standard_memory_allocator(&self) -> Arc<StandardMemoryAllocator> {
-        self.standard_memory_allocator.clone()
+    pub fn present_queue(&self) -> &Arc<Queue> {
+        &self.present_queue
     }
 
-    pub(crate) fn window(&self) -> &Arc<Window> {
-        &self.window
+    pub fn standard_memory_allocator(&self) -> &Arc<StandardMemoryAllocator> {
+        &self.standard_memory_allocator
     }
 
-    pub(crate) fn window_surface(&self) -> Arc<Surface> {
-        self.surface.clone()
+    pub fn standard_command_buffer_allocator(&self) -> &Arc<StandardCommandBufferAllocator> {
+        &self.standard_command_buffer_allocator
     }
 
-    fn create_instance() -> Arc<Instance> {
-        let library = VulkanLibrary::new().expect("Failed to load vulkan library");
+    fn create_instance() -> Result<Arc<Instance>> {
+        let library = VulkanLibrary::new()?;
 
         let mut enabled_extensions = InstanceExtensions::empty();
         enabled_extensions.ext_validation_features = true;
@@ -113,9 +113,7 @@ impl Vulkan {
         enabled_extensions.khr_xcb_surface = true;
         enabled_extensions.khr_xlib_surface = true;
 
-        let layer_properties = library
-            .layer_properties()
-            .expect("Failed to layer properties");
+        let layer_properties = library.layer_properties()?;
 
         let enabled_layers = layer_properties
             .into_iter()
@@ -144,10 +142,11 @@ impl Vulkan {
             ..Default::default()
         };
 
-        Instance::new(library, instance_info).expect("Failed to create instance")
+        let instance = Instance::new(library, instance_info)?;
+        Ok(instance)
     }
 
-    fn create_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
+    fn create_debug_messenger(instance: &Arc<Instance>) -> Result<DebugUtilsMessenger> {
         let messenger_info = unsafe {
             DebugUtilsMessengerCreateInfo::user_callback(DebugUtilsMessengerCallback::new(
                 |_message_severity, _message_type, callback_data| {
@@ -156,32 +155,15 @@ impl Vulkan {
             ))
         };
 
-        DebugUtilsMessenger::new(instance.clone(), messenger_info)
-            .expect("Failed to create debug messenger")
-    }
+        let messenger = DebugUtilsMessenger::new(instance.clone(), messenger_info)?;
 
-    fn create_window(
-        instance: &Arc<Instance>,
-        event_loop: &EventLoop<()>,
-    ) -> (Arc<Window>, Arc<Surface>) {
-        let window = WindowBuilder::new()
-            .with_title("Vulkan application")
-            .with_resizable(false)
-            .build(event_loop)
-            .expect("Failed to create window");
-
-        let window = Arc::new(window);
-
-        let surface = Surface::from_window(instance.clone(), window.clone())
-            .expect("Failed to create window surface");
-
-        (window, surface)
+        Ok(messenger)
     }
 
     fn find_queue_family_indices(
         device: &Arc<PhysicalDevice>,
         surface: &Arc<Surface>,
-    ) -> QueueFamilyIndices {
+    ) -> Result<QueueFamilyIndices> {
         let mut indices = QueueFamilyIndices {
             graphic_family: None,
             present_family: None,
@@ -192,36 +174,29 @@ impl Vulkan {
                 indices.graphic_family = Some(i as u32);
             }
 
-            if device
-                .surface_support(i as u32, surface.as_ref())
-                .expect("Failed to check surface support")
-            {
+            if device.surface_support(i as u32, surface.as_ref())? {
                 indices.present_family = Some(i as u32);
             }
 
             if indices.is_complete() {
-                return indices;
+                return Ok(indices);
             }
         }
 
-        indices
+        Ok(indices)
     }
 
-    fn is_device_suitable(device: &Arc<PhysicalDevice>, surface: &Arc<Surface>) -> bool {
-        Self::find_queue_family_indices(device, surface).is_complete()
+    fn is_device_suitable(device: &Arc<PhysicalDevice>, surface: &Arc<Surface>) -> Result<bool> {
+        Ok(Self::find_queue_family_indices(device, surface)?.is_complete())
     }
 
     fn choose_physical_device(
         instance: &Arc<Instance>,
         surface: &Arc<Surface>,
-    ) -> Arc<PhysicalDevice> {
-        for device in instance
-            .enumerate_physical_devices()
-            .expect("Failed to enumerate physical devices")
-            .into_iter()
-        {
-            if Self::is_device_suitable(&device, surface) {
-                return device;
+    ) -> Result<Arc<PhysicalDevice>> {
+        for device in instance.enumerate_physical_devices()?.into_iter() {
+            if Self::is_device_suitable(&device, surface)? {
+                return Ok(device);
             }
         }
 
@@ -231,17 +206,16 @@ impl Vulkan {
     fn create_logical_device(
         instance: &Arc<Instance>,
         surface: &Arc<Surface>,
-    ) -> (Arc<Device>, Arc<Queue>, Arc<Queue>) {
-        let physical_device = Self::choose_physical_device(instance, surface);
+    ) -> Result<(Arc<Device>, Arc<Queue>, Arc<Queue>)> {
+        let physical_device = Self::choose_physical_device(instance, surface)?;
 
         let mut enabled_extensions = DeviceExtensions::empty();
         enabled_extensions.khr_swapchain = true;
-        enabled_extensions.khr_push_descriptor = true;
 
         let mut enabled_features = Features::empty();
         enabled_features.fill_mode_non_solid = true;
 
-        let indices = Self::find_queue_family_indices(&physical_device, surface);
+        let indices = Self::find_queue_family_indices(&physical_device, surface)?;
         let mut unique_indices = vec![indices.graphic_family.unwrap()];
         unique_indices.sort();
         unique_indices.dedup();
@@ -268,9 +242,9 @@ impl Vulkan {
                 let graphics_queue = queues.next().unwrap();
                 let present_queue = queues.next().unwrap_or(graphics_queue.clone());
 
-                (device, graphics_queue, present_queue)
+                Ok((device, graphics_queue, present_queue))
             }
-            Err(error) => panic!("Failed to create logical device: {:?}", error),
+            Err(error) => Err(error.into()),
         }
     }
 }

@@ -1,31 +1,42 @@
-use winit::event_loop::EventLoop;
+use std::sync::Arc;
 
 use self::renderer::Renderer;
 
 pub mod mesh;
+pub mod render_object;
 pub mod renderer;
-mod vulkan;
+pub mod input_handler;
+pub mod scene;
 
-use vulkan::Vulkan;
+use crate::vulkan_context::VulkanContext;
+
+use anyhow::Result;
+use winit::window::Window;
 
 pub struct Engine {
-    vulkan: Vulkan,
+    vulkan_context: Arc<VulkanContext>,
+    renderer: Renderer,
 }
 
 impl Engine {
-    pub(crate) fn new() -> (Self, EventLoop<()>) {
-        let (vulkan, event_loop) = Vulkan::new();
+    pub(crate) fn new(vulkan_context: Arc<VulkanContext>, window: Arc<Window>) -> Result<Self> {
+        let renderer = Renderer::new(Arc::clone(&vulkan_context), window)?;
 
-        let engine = Self { vulkan };
-
-        (engine, event_loop)
+        Ok(Self {
+            vulkan_context,
+            renderer,
+        })
     }
 
-    pub fn create_renderer(&self) -> Renderer {
-        Renderer::new(self)
+    pub(crate) fn vulkan_context(&self) -> &VulkanContext {
+        &self.vulkan_context
     }
 
-    pub(crate) fn vulkan(&self) -> &Vulkan {
-        &self.vulkan
+    pub(crate) fn renderer(&self) -> &Renderer {
+        &self.renderer
     }
+
+    pub(crate) fn suspend(&self) {}
+
+    pub(crate) fn resume(&self, _window: Arc<Window>) {}
 }

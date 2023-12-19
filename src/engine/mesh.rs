@@ -27,7 +27,7 @@ pub struct Mesh {
 
 impl Mesh {
     pub fn new(engine: &Engine, vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
-        let allocator = engine.vulkan().standard_memory_allocator();
+        let allocator = engine.vulkan_context().standard_memory_allocator();
 
         let vertex_buffer_info = BufferCreateInfo {
             sharing: Sharing::Exclusive, // TODO: handle sharing across different queues

@@ -3,15 +3,17 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 
+use anyhow::Result;
+
 use vulkano::buffer::Buffer;
 use vulkano::descriptor_set::allocator::{
     StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
 };
 use vulkano::descriptor_set::{DescriptorSet, PersistentDescriptorSet, WriteDescriptorSet};
+use vulkano::swapchain::Surface;
 use vulkano::{
     buffer::{BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
         AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
     },
@@ -20,7 +22,6 @@ use vulkano::{
         DescriptorSetLayoutCreateFlags, DescriptorSetLayoutCreateInfo, DescriptorType,
     },
     device::Device,
-    device::Queue,
     format::{ClearValue, Format},
     image::{
         sampler::ComponentMapping,
@@ -66,11 +67,10 @@ use winit::window::Window;
 use glam::{Mat4, Vec3};
 
 use crate::camera::Camera3D;
+use crate::vulkan_context::VulkanContext;
 
-use super::{
-    mesh::{Mesh, Vertex as MyVertex},
-    Engine,
-};
+use super::mesh::Vertex as MyVertex;
+use super::scene::Scene;
 
 mod shaders {
     vulkano_shaders::shader! {
@@ -97,9 +97,7 @@ struct MVP {
 }
 
 pub struct Renderer {
-    _device: Arc<Device>,
-    graphics_queue: Arc<Queue>,
-    present_queue: Arc<Queue>,
+    vulkan_context: Arc<VulkanContext>,
 
     swapchain: Arc<Swapchain>,
     _swapchain_images: Vec<Arc<Image>>,
@@ -107,11 +105,10 @@ pub struct Renderer {
 
     render_pass: Arc<RenderPass>,
     framebuffers: Vec<Arc<Framebuffer>>,
+
     graphic_pipeline: Arc<GraphicsPipeline>,
     pipeline_layout: Arc<PipelineLayout>,
     _descriptor_set_layout: Arc<DescriptorSetLayout>,
-
-    command_buffer_allocator: StandardCommandBufferAllocator,
     _descriptor_set_allocator: StandardDescriptorSetAllocator,
 
     mvp_buffer: Subbuffer<[MVP]>,
@@ -119,15 +116,10 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub(crate) fn new(engine: &Engine) -> Self {
-        let vulkan = engine.vulkan();
+    pub(crate) fn new(vulkan_context: Arc<VulkanContext>, window: Arc<Window>) -> Result<Self> {
+        let device = vulkan_context.device();
 
-        let device = vulkan.device();
-
-        let graphics_queue = vulkan.graphics_queue();
-        let present_queue = vulkan.present_queue();
-
-        let (swapchain, swapchain_images) = Self::create_swapchain(engine);
+        let (swapchain, swapchain_images) = Self::create_swapchain(&vulkan_context, &window)?;
         let swapchain_image_views =
             Self::create_swapchain_image_views(&swapchain, &swapchain_images);
 
@@ -138,20 +130,17 @@ impl Renderer {
         let (graphic_pipeline, pipeline_layout, descriptor_set_layout) =
             Self::create_graphic_pipeline(&device, &swapchain, &render_pass);
 
-        let command_buffer_allocator = Self::create_command_buffer_allocator(&device);
         let descriptor_set_allocator = Self::create_descriptor_set_allocator(&device);
 
-        let mvp_buffer = Self::create_mvp_buffer(&vulkan.standard_memory_allocator());
+        let mvp_buffer = Self::create_mvp_buffer(vulkan_context.standard_memory_allocator());
         let mvp_descriptor_set = Self::create_mvp_descriptor_set(
             &descriptor_set_allocator,
             &descriptor_set_layout,
             &mvp_buffer,
         );
 
-        Self {
-            _device: device.clone(),
-            graphics_queue,
-            present_queue,
+        Ok(Self {
+            vulkan_context,
 
             swapchain,
             _swapchain_images: swapchain_images,
@@ -162,19 +151,20 @@ impl Renderer {
             graphic_pipeline,
             pipeline_layout,
             _descriptor_set_layout: descriptor_set_layout,
-
-            command_buffer_allocator,
             _descriptor_set_allocator: descriptor_set_allocator,
 
             mvp_buffer,
             mvp_descriptor_set,
-        }
+        })
     }
 
-    pub fn draw_frame(&self, mesh: &Mesh, camera: &Camera3D) {
+    pub fn clear_screen(&self) -> Result<()> {
+        todo!("Rendering currently clears automaticaly => TODO: Handle rendering without clearing");
+    }
+
+    pub fn render_scene(&self, scene: &Scene, camera: &Camera3D) -> Result<()> {
         let (image_index, _suboptimal, swapchain_future) =
-            swapchain::acquire_next_image(self.swapchain.clone(), None)
-                .expect("Failed to acquire next image");
+            swapchain::acquire_next_image(self.swapchain.clone(), None)?;
 
         let view = camera.get_view();
         {
@@ -184,29 +174,32 @@ impl Renderer {
             }
         }
 
-        let command_buffer = self.record_draw_command_buffer(image_index as usize, mesh);
+        let command_buffer = self.record_draw_command_buffer(image_index as usize, scene)?;
 
         let _ = swapchain_future
-            .then_execute(self.graphics_queue.clone(), command_buffer)
-            .expect("Failed to execute draw command buffer")
+            .then_execute(
+                Arc::clone(self.vulkan_context.graphics_queue()),
+                command_buffer,
+            )?
             .then_swapchain_present(
-                self.present_queue.clone(),
+                Arc::clone(self.vulkan_context.present_queue()),
                 SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index),
             )
-            .then_signal_fence_and_flush()
-            .expect("Failed to signal fence");
+            .then_signal_fence_and_flush()?;
+
+        Ok(())
     }
 
     fn record_draw_command_buffer(
         &self,
         image_index: usize,
-        mesh: &Mesh,
-    ) -> Arc<PrimaryAutoCommandBuffer> {
+        scene: &Scene,
+    ) -> Result<Arc<PrimaryAutoCommandBuffer>> {
         let render_pass_begin_info = RenderPassBeginInfo {
             render_pass: self.render_pass.clone(),
             render_area_offset: [0, 0],
             render_area_extent: self.swapchain.image_extent(),
-            clear_values: vec![Some(ClearValue::Float([0.0, 0.0, 0.0, 1.0]))],
+            clear_values: vec![Some(ClearValue::Float([0.5, 0.5, 0.5, 1.0]))],
             ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index].clone())
         };
 
@@ -220,39 +213,38 @@ impl Renderer {
         };
 
         let mut builder = AutoCommandBufferBuilder::primary(
-            &self.command_buffer_allocator,
-            self.graphics_queue.queue_family_index(),
+            self.vulkan_context
+                .standard_command_buffer_allocator()
+                .as_ref(),
+            self.vulkan_context.graphics_queue().queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
-        )
-        .expect("Failed to start recording command buffer");
-
-        let vertex_buffer = mesh.vectex_buffer();
-        let index_buffer = mesh.index_buffer();
+        )?;
 
         builder
-            .begin_render_pass(render_pass_begin_info, subpass_begin_info)
-            .expect("Failed to begin render pass command")
-            .bind_pipeline_graphics(self.graphic_pipeline.clone())
-            .expect("Failed to bind graphics pipeline")
-            .bind_vertex_buffers(0, vertex_buffer.clone())
-            .expect("Failed to bind vertex buffer")
-            .bind_index_buffer(index_buffer.clone())
-            .expect("Failed to bind index buffer")
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.pipeline_layout.clone(),
-                0,
-                self.mvp_descriptor_set.clone().offsets([]),
-            )
-            .expect("Failed to bind descriptor set")
-            .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
-            .expect("Failed draw command")
-            .end_render_pass(subpass_end_info)
-            .expect("Failed end render pass command");
+            .begin_render_pass(render_pass_begin_info, subpass_begin_info)?
+            .bind_pipeline_graphics(Arc::clone(&self.graphic_pipeline))?;
 
-        let command_buffer = builder.build().expect("Failed to build command buffer");
+        for mesh in scene.meshes() {
+            let vertex_buffer = mesh.vectex_buffer();
+            let index_buffer = mesh.index_buffer();
 
-        command_buffer
+            builder
+                .bind_vertex_buffers(0, vertex_buffer.clone())?
+                .bind_index_buffer(index_buffer.clone())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    self.pipeline_layout.clone(),
+                    0,
+                    self.mvp_descriptor_set.clone().offsets([]),
+                )?
+                .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)?;
+        }
+
+        builder.end_render_pass(subpass_end_info)?;
+
+        let command_buffer = builder.build()?;
+
+        Ok(command_buffer)
     }
 
     fn get_minimum_image_count(capabilities: &SurfaceCapabilities) -> u32 {
@@ -311,10 +303,11 @@ impl Renderer {
         PresentMode::Fifo
     }
 
-    fn create_swapchain(engine: &Engine) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
-        let vulkan = engine.vulkan();
-
-        let device = vulkan.device();
+    fn create_swapchain(
+        vulkan_context: &Arc<VulkanContext>,
+        window: &Arc<Window>,
+    ) -> Result<(Arc<Swapchain>, Vec<Arc<Image>>)> {
+        let device = vulkan_context.device();
         let physical_device = device.physical_device();
 
         let surface_info = SurfaceInfo {
@@ -322,30 +315,22 @@ impl Renderer {
             ..Default::default()
         };
 
-        let surface = vulkan.window_surface();
+        let surface =
+            Surface::from_window(Arc::clone(vulkan_context.instance()), Arc::clone(window))?;
 
-        let surface_capabilities = physical_device
-            .surface_capabilities(surface.as_ref(), surface_info.clone())
-            .expect("Failed to get surface capabilities");
+        let surface_capabilities =
+            physical_device.surface_capabilities(surface.as_ref(), surface_info.clone())?;
 
-        let available_formats = physical_device
-            .surface_formats(surface.as_ref(), surface_info.clone())
-            .expect("Failed to get surface formats");
+        let available_formats =
+            physical_device.surface_formats(surface.as_ref(), surface_info.clone())?;
 
         let (format, color_space) = Self::choose_swapchain_format(available_formats);
-        let extent = Self::choose_swapchain_extent(&vulkan.window(), &surface_capabilities);
+        let extent = Self::choose_swapchain_extent(window, &surface_capabilities);
 
-        let sharing = if vulkan.graphics_queue().queue_family_index()
-            == vulkan.present_queue().queue_family_index()
-        {
-            Sharing::Exclusive
-        } else {
-            todo!()
-        };
+        let sharing = Sharing::Exclusive;
 
         let available_present_modes = physical_device
-            .surface_present_modes(surface.as_ref(), surface_info)
-            .expect("Failed to get supported present modes")
+            .surface_present_modes(surface.as_ref(), surface_info)?
             .collect();
         let present_mode = Self::choose_present_mode(available_present_modes);
 
@@ -364,8 +349,10 @@ impl Renderer {
             ..Default::default()
         };
 
-        Swapchain::new(device.clone(), surface.clone(), swapchain_info)
-            .expect("Failed to create swapchain")
+        let (swapchain, swapchain_images) =
+            Swapchain::new(device.clone(), surface.clone(), swapchain_info)?;
+
+        Ok((swapchain, swapchain_images))
     }
 
     fn create_swapchain_image_views(
@@ -584,16 +571,6 @@ impl Renderer {
             .expect("Failed to create graphic pipeline");
 
         (pipeline, pipeline_layout, descriptor_set_layout)
-    }
-
-    fn create_command_buffer_allocator(device: &Arc<Device>) -> StandardCommandBufferAllocator {
-        let allocator_info = StandardCommandBufferAllocatorCreateInfo {
-            primary_buffer_count: 16,
-            secondary_buffer_count: 0,
-            ..Default::default()
-        };
-
-        StandardCommandBufferAllocator::new(device.clone(), allocator_info)
     }
 
     fn create_mvp_buffer(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[MVP]> {
