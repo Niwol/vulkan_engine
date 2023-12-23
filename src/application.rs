@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use winit::dpi::{LogicalSize, Size};
-use winit::event::{Event, WindowEvent};
+use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::EventLoopWindowTarget;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::WindowBuilder;
 use winit::{
     event_loop::{ControlFlow, EventLoop},
@@ -12,14 +13,20 @@ use winit::{
 
 use anyhow::{Ok, Result};
 
+use crate::engine::input_handler::InputHandler;
 use crate::engine::renderer::Renderer;
 use crate::engine::Engine;
 use crate::vulkan_context::VulkanContext;
 
 pub trait Runable {
-    fn on_update(&mut self, input: i32, window: &Arc<Window>, frame_info: &FrameInfo) -> bool;
+    fn on_update(
+        &mut self,
+        input: &InputHandler,
+        window: &Arc<Window>,
+        frame_info: &FrameInfo,
+    ) -> bool;
 
-    fn render(&mut self, renderer: &Renderer);
+    fn render(&mut self, renderer: &mut Renderer);
 }
 
 pub struct FrameInfo {
@@ -30,6 +37,7 @@ pub struct ApplicationInfo {
     pub window_title: String,
     pub window_size: [u32; 2],
     pub resizeable: bool,
+    pub exit_on_escape: bool,
 }
 
 impl Default for ApplicationInfo {
@@ -38,6 +46,7 @@ impl Default for ApplicationInfo {
             window_title: String::from("Vulkan application"),
             window_size: [800, 600],
             resizeable: false,
+            exit_on_escape: false,
         }
     }
 }
@@ -53,6 +62,9 @@ where
 
     frame_info: FrameInfo,
     previous_frame_time: Instant,
+
+    input_handler: InputHandler,
+    exit_on_escape: bool,
 }
 
 impl<T> Application<T>
@@ -86,6 +98,9 @@ where
 
             frame_info: FrameInfo { delta_time: 0.0 },
             previous_frame_time: Instant::now(),
+
+            input_handler: InputHandler::new(),
+            exit_on_escape: application_info.exit_on_escape,
         };
 
         app.start(event_loop)?;
@@ -114,8 +129,10 @@ where
             Event::NewEvents(_) => {
                 self.frame_info.delta_time =
                     Instant::elapsed(&self.previous_frame_time).as_secs_f32();
-                
+
                 self.previous_frame_time = Instant::now();
+
+                self.input_handler.step();
             }
 
             Event::WindowEvent { event, .. } => {
@@ -126,13 +143,18 @@ where
             Event::Resumed => self.engine.resume(Arc::clone(&self.window)),
 
             Event::AboutToWait => {
-                self.runable.on_update(0, &self.window, &self.frame_info);
+                self.runable
+                    .on_update(&self.input_handler, &self.window, &self.frame_info);
+
+                //println!("{:?}", self.input_handler);
 
                 self.window.request_redraw();
             }
 
             _ => (),
         }
+
+        self.input_handler.update(&event);
 
         Ok(())
     }
@@ -147,7 +169,25 @@ where
                 window_target.exit();
             }
 
-            WindowEvent::RedrawRequested => self.runable.render(self.engine.renderer()),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if self.exit_on_escape {
+                    window_target.exit();
+                }
+            }
+
+            WindowEvent::Resized(new_size) => {
+                self.engine.handle_window_resized(*new_size)?;
+            }
+
+            WindowEvent::RedrawRequested => self.runable.render(self.engine.renderer_mut()),
 
             _ => (),
         }

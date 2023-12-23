@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use smallvec::smallvec;
@@ -10,6 +11,8 @@ use vulkano::descriptor_set::allocator::{
     StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
 };
 use vulkano::descriptor_set::{DescriptorSet, PersistentDescriptorSet, WriteDescriptorSet};
+use vulkano::pipeline::layout::PushConstantRange;
+use vulkano::pipeline::DynamicState;
 use vulkano::swapchain::Surface;
 use vulkano::{
     buffer::{BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -61,7 +64,9 @@ use vulkano::{
     },
     sync::{GpuFuture, Sharing},
 };
+use vulkano::{Validated, VulkanError};
 
+use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use glam::{Mat4, Vec3};
@@ -98,6 +103,7 @@ struct MVP {
 
 pub struct Renderer {
     vulkan_context: Arc<VulkanContext>,
+    window: Arc<Window>,
 
     swapchain: Arc<Swapchain>,
     _swapchain_images: Vec<Arc<Image>>,
@@ -121,11 +127,11 @@ impl Renderer {
 
         let (swapchain, swapchain_images) = Self::create_swapchain(&vulkan_context, &window)?;
         let swapchain_image_views =
-            Self::create_swapchain_image_views(&swapchain, &swapchain_images);
+            Self::create_swapchain_image_views(&swapchain, &swapchain_images)?;
 
         let render_pass = Self::create_render_pass(&device, &swapchain);
         let framebuffers =
-            Self::create_framebuffers(&render_pass, &swapchain, &swapchain_image_views);
+            Self::create_framebuffers(&render_pass, &swapchain, &swapchain_image_views)?;
 
         let (graphic_pipeline, pipeline_layout, descriptor_set_layout) =
             Self::create_graphic_pipeline(&device, &swapchain, &render_pass);
@@ -141,6 +147,7 @@ impl Renderer {
 
         Ok(Self {
             vulkan_context,
+            window,
 
             swapchain,
             _swapchain_images: swapchain_images,
@@ -162,21 +169,32 @@ impl Renderer {
         todo!("Rendering currently clears automaticaly => TODO: Handle rendering without clearing");
     }
 
-    pub fn render_scene(&self, scene: &Scene, camera: &Camera3D) -> Result<()> {
+    pub fn render_scene(&mut self, scene: &Scene, camera: &Camera3D) -> Result<()> {
         let (image_index, _suboptimal, swapchain_future) =
-            swapchain::acquire_next_image(self.swapchain.clone(), None)?;
+            match swapchain::acquire_next_image(self.swapchain.clone(), None)
+                .map_err(Validated::unwrap)
+            {
+                Ok(x) => x,
+                Err(vulkano::VulkanError::OutOfDate) => panic!(),
+                Err(e) => panic!("{e}"),
+            };
 
         let view = camera.get_view();
         {
+            let [width, height] = self.swapchain.image_extent().map(|x| x as f32);
             let mut buffer_write = self.mvp_buffer.write().unwrap();
             for mvp in buffer_write.iter_mut() {
                 mvp.view = view;
+                mvp.projection =
+                    Mat4::perspective_rh(f32::to_radians(45.0), width / height, 0.1, 100.0);
+                mvp.projection.as_mut()[1 * 4 + 1] *= -1.0;
             }
         }
 
-        let command_buffer = self.record_draw_command_buffer(image_index as usize, scene)?;
+        let command_buffer =
+            self.record_draw_command_buffer(image_index as usize, scene, camera)?;
 
-        let _ = swapchain_future
+        let future = swapchain_future
             .then_execute(
                 Arc::clone(self.vulkan_context.graphics_queue()),
                 command_buffer,
@@ -185,7 +203,17 @@ impl Renderer {
                 Arc::clone(self.vulkan_context.present_queue()),
                 SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index),
             )
-            .then_signal_fence_and_flush()?;
+            .then_signal_fence_and_flush();
+
+        match future.map_err(Validated::unwrap) {
+            Ok(_) => (),
+
+            Err(VulkanError::OutOfDate) => {
+                self.resize(self.window.inner_size())?;
+            }
+
+            Err(e) => panic!("{:#?}", e),
+        }
 
         Ok(())
     }
@@ -194,6 +222,7 @@ impl Renderer {
         &self,
         image_index: usize,
         scene: &Scene,
+        camera: &Camera3D,
     ) -> Result<Arc<PrimaryAutoCommandBuffer>> {
         let render_pass_begin_info = RenderPassBeginInfo {
             render_pass: self.render_pass.clone(),
@@ -220,22 +249,57 @@ impl Renderer {
             CommandBufferUsage::OneTimeSubmit,
         )?;
 
+        let [width, height] = self.swapchain.image_extent().map(|x| x as f32);
+        let mut projection = glam::Mat4::perspective_rh(f32::to_radians(45.0), width / height, 0.1, 100.0);
+        projection.as_mut()[1 * 4 + 1] *= -1.0;
+
         builder
             .begin_render_pass(render_pass_begin_info, subpass_begin_info)?
-            .bind_pipeline_graphics(Arc::clone(&self.graphic_pipeline))?;
+            .bind_pipeline_graphics(Arc::clone(&self.graphic_pipeline))?
+            .push_constants(
+                Arc::clone(&self.pipeline_layout),
+                16 * size_of::<f32>() as u32,
+                camera.get_view(),
+            )?
+            .push_constants(
+                Arc::clone(&self.pipeline_layout),
+                2* 16 * size_of::<f32>() as u32,
+                projection
+            )?
+            .set_viewport(
+                0,
+                smallvec![Viewport {
+                    offset: [0.0, 0.0],
+                    extent: self.swapchain.image_extent().map(|x| x as f32),
+                    depth_range: 0.0..=1.0,
+                }],
+            )?
+            .set_scissor(
+                0,
+                smallvec![Scissor {
+                    offset: [0, 0],
+                    extent: self.swapchain.image_extent()
+                }],
+            )?;
 
-        for mesh in scene.meshes() {
-            let vertex_buffer = mesh.vectex_buffer();
-            let index_buffer = mesh.index_buffer();
+        for render_object in scene.render_objects() {
+            let vertex_buffer = render_object.mesh().vectex_buffer();
+            let index_buffer = render_object.mesh().index_buffer();
+
+            {
+                let mut buffer_write = self.mvp_buffer.write().unwrap();
+                for mvp in buffer_write.iter_mut() {
+                    mvp.model = render_object.transform().transform();
+                }
+            }
 
             builder
                 .bind_vertex_buffers(0, vertex_buffer.clone())?
                 .bind_index_buffer(index_buffer.clone())?
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    self.pipeline_layout.clone(),
+                .push_constants(
+                    Arc::clone(&self.pipeline_layout),
                     0,
-                    self.mvp_descriptor_set.clone().offsets([]),
+                    render_object.transform().transform(),
                 )?
                 .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)?;
         }
@@ -358,7 +422,7 @@ impl Renderer {
     fn create_swapchain_image_views(
         swapchain: &Arc<Swapchain>,
         swapchain_images: &Vec<Arc<Image>>,
-    ) -> Vec<Arc<ImageView>> {
+    ) -> Result<Vec<Arc<ImageView>>> {
         let mut image_views = Vec::new();
 
         for image in swapchain_images.iter() {
@@ -375,19 +439,17 @@ impl Renderer {
                 ..Default::default()
             };
 
-            image_views.push(
-                ImageView::new(image.clone(), view_info).expect("Failed to create image view"),
-            );
+            image_views.push(ImageView::new(image.clone(), view_info)?);
         }
 
-        image_views
+        Ok(image_views)
     }
 
     fn create_framebuffers(
         render_pass: &Arc<RenderPass>,
         swapchain: &Arc<Swapchain>,
         image_views: &Vec<Arc<ImageView>>,
-    ) -> Vec<Arc<Framebuffer>> {
+    ) -> Result<Vec<Arc<Framebuffer>>> {
         let mut framebuffers = Vec::new();
 
         for image_view in image_views.iter() {
@@ -398,13 +460,10 @@ impl Renderer {
                 ..Default::default()
             };
 
-            framebuffers.push(
-                Framebuffer::new(render_pass.clone(), framebuffer_info)
-                    .expect("Failed to create framebuffer"),
-            );
+            framebuffers.push(Framebuffer::new(render_pass.clone(), framebuffer_info)?);
         }
 
-        framebuffers
+        Ok(framebuffers)
     }
 
     fn create_render_pass(device: &Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<RenderPass> {
@@ -472,8 +531,12 @@ impl Renderer {
 
         let layout_info = PipelineLayoutCreateInfo {
             flags: PipelineLayoutCreateFlags::empty(),
-            set_layouts: vec![mvp_descriptor_set.clone()],
-            push_constant_ranges: Vec::new(),
+            set_layouts: Vec::new(),
+            push_constant_ranges: vec![PushConstantRange {
+                stages: ShaderStages::VERTEX,
+                offset: 0,
+                size: 3 * 16 * size_of::<f32>() as u32,
+            }],
             ..Default::default()
         };
 
@@ -564,6 +627,11 @@ impl Renderer {
             }),
             subpass: Some(Subpass::from(render_pass.clone(), 0).unwrap().into()),
             discard_rectangle_state: None,
+
+            dynamic_state: [DynamicState::Viewport, DynamicState::Scissor]
+                .into_iter()
+                .collect(),
+
             ..GraphicsPipelineCreateInfo::layout(pipeline_layout.clone())
         };
 
@@ -627,5 +695,30 @@ impl Renderer {
             Vec::new(),
         )
         .expect("Failed to create mvp descriptor set")
+    }
+
+    pub(crate) fn resize(&mut self, new_size: PhysicalSize<u32>) -> Result<()> {
+        let (new_swapchain, new_swapchain_images) =
+            self.swapchain.recreate(SwapchainCreateInfo {
+                image_extent: [new_size.width, new_size.height],
+                image_usage: ImageUsage::COLOR_ATTACHMENT,
+                ..self.swapchain.create_info()
+            })?;
+
+        let new_swapchain_image_views =
+            Self::create_swapchain_image_views(&new_swapchain, &new_swapchain_images)?;
+
+        let new_framebuffers = Self::create_framebuffers(
+            &self.render_pass,
+            &new_swapchain,
+            &new_swapchain_image_views,
+        )?;
+
+        self.swapchain = new_swapchain;
+        self._swapchain_images = new_swapchain_images;
+        self._swapchain_image_views = new_swapchain_image_views;
+        self.framebuffers = new_framebuffers;
+
+        Ok(())
     }
 }

@@ -1,10 +1,12 @@
 use std::f32::consts::FRAC_PI_2;
 
 use glam::{Mat4, Vec3};
-use winit::keyboard::KeyCode;
+use winit::{event::MouseButton, keyboard::KeyCode};
+
+use crate::engine::input_handler::InputHandler;
 
 pub trait Camera3DController {
-    fn update_camera(&mut self, input: i32, camera: &mut Camera3D, delta_time: f32);
+    fn update_camera(&mut self, input: &InputHandler, camera: &mut Camera3D, delta_time: f32);
 }
 
 pub struct Camera3D {
@@ -72,12 +74,12 @@ impl Camera3D {
         self.position += self.world_up * amount;
     }
 
-    pub fn move_world_down(&mut self, amount: f32) {
-        self.position -= self.world_up * amount;
-    }
-
     pub fn move_down(&mut self, amount: f32) {
         self.position -= self.up * amount;
+    }
+
+    pub fn move_world_down(&mut self, amount: f32) {
+        self.position -= self.world_up * amount;
     }
 
     pub fn move_left(&mut self, amount: f32) {
@@ -129,7 +131,7 @@ impl Camera3D {
     }
 
     pub(crate) fn get_view(&self) -> Mat4 {
-        Mat4::look_to_rh(self.position, self.front, self.up)
+        Mat4::look_at_rh(self.position, self.position + self.front, self.up)
     }
 
     fn update_camera_vectors(&mut self) {
@@ -138,8 +140,8 @@ impl Camera3D {
         let pitch_cos = self.pitch.cos();
         let front_x = self.yaw.cos() * pitch_cos;
         let front_z = self.yaw.sin() * pitch_cos;
-        self.front = Vec3::new(front_x, front_y, front_z);
-        self.right = self.front.cross(self.world_up);
+        self.front = Vec3::new(front_x, front_y, front_z).normalize();
+        self.right = self.front.cross(self.world_up).normalize();
         self.up = self.right.cross(self.front);
     }
 }
@@ -153,7 +155,7 @@ impl DebugCamera3DController {
     pub fn new() -> Self {
         Self {
             camera_speed: 10.0,
-            mouse_sensitivity: 0.5,
+            mouse_sensitivity: 0.3,
         }
     }
 
@@ -167,37 +169,37 @@ impl DebugCamera3DController {
 }
 
 impl Camera3DController for DebugCamera3DController {
-    fn update_camera(&mut self, input: i32, camera: &mut Camera3D, delta_time: f32) {
-        //        if input.key_held(KeyCode::KeyW) {
-        //            camera.move_xz_forwards(self.camera_speed * delta_time);
-        //        }
-        //        if input.key_held(KeyCode::KeyS) {
-        //            camera.move_xz_backwards(self.camera_speed * delta_time);
-        //        }
-        //        if input.key_held(KeyCode::KeyA) {
-        //            camera.move_left(self.camera_speed * delta_time);
-        //        }
-        //        if input.key_held(KeyCode::KeyD) {
-        //            camera.move_right(self.camera_speed * delta_time);
-        //        }
-        //        if input.key_held(KeyCode::Space) {
-        //            camera.move_world_up(self.camera_speed * delta_time);
-        //        }
-        //        if input.key_held(KeyCode::ControlLeft) {
-        //            camera.move_world_down(self.camera_speed * delta_time);
-        //        }
-        //
-        //        if input.mouse_held(0) {
-        //            let (mouse_diff_x, mouse_diff_y) = input.mouse_diff();
-        //            let mut yaw = camera.yaw();
-        //            let mut pitch = camera.pitch();
-        //
-        //            yaw += mouse_diff_x * self.mouse_sensitivity * delta_time;
-        //            pitch -= mouse_diff_y * self.mouse_sensitivity * delta_time;
-        //
-        //            pitch = pitch.clamp(-FRAC_PI_2 + 0.1, FRAC_PI_2 - 0.1);
-        //
-        //            camera.set_pitch_and_yaw(yaw, pitch);
-        //        }
+    fn update_camera(&mut self, input: &InputHandler, camera: &mut Camera3D, delta_time: f32) {
+        if input.key_held(KeyCode::KeyW) {
+            camera.move_xz_forwards(self.camera_speed * delta_time);
+        }
+        if input.key_held(KeyCode::KeyS) {
+            camera.move_xz_backwards(self.camera_speed * delta_time);
+        }
+        if input.key_held(KeyCode::KeyA) {
+            camera.move_left(self.camera_speed * delta_time);
+        }
+        if input.key_held(KeyCode::KeyD) {
+            camera.move_right(self.camera_speed * delta_time);
+        }
+        if input.key_held(KeyCode::Space) {
+            camera.move_world_up(self.camera_speed * delta_time);
+        }
+        if input.key_held(KeyCode::ControlLeft) {
+            camera.move_world_down(self.camera_speed * delta_time);
+        }
+
+        if input.mouse_held(MouseButton::Left) {
+            let (mouse_diff_x, mouse_diff_y) = input.mouse_diff();
+            let mut yaw = camera.yaw();
+            let mut pitch = camera.pitch();
+
+            yaw += mouse_diff_x * self.mouse_sensitivity * delta_time;
+            pitch -= mouse_diff_y * self.mouse_sensitivity * delta_time;
+
+            pitch = pitch.clamp(-FRAC_PI_2 + 0.1, FRAC_PI_2 - 0.1);
+
+            camera.set_pitch_and_yaw(yaw, pitch);
+        }
     }
 }

@@ -2,16 +2,17 @@ use std::sync::Arc;
 
 use self::renderer::Renderer;
 
+pub mod input_handler;
 pub mod mesh;
 pub mod render_object;
 pub mod renderer;
-pub mod input_handler;
 pub mod scene;
+pub mod transform;
 
 use crate::vulkan_context::VulkanContext;
 
-use anyhow::Result;
-use winit::window::Window;
+use anyhow::{Result, Ok};
+use winit::{window::Window, dpi::PhysicalSize};
 
 pub struct Engine {
     vulkan_context: Arc<VulkanContext>,
@@ -32,8 +33,17 @@ impl Engine {
         &self.vulkan_context
     }
 
-    pub(crate) fn renderer(&self) -> &Renderer {
+    pub(crate) fn _renderer(&self) -> &Renderer {
         &self.renderer
+    }
+
+    pub(crate) fn renderer_mut(&mut self) -> &mut Renderer {
+        &mut self.renderer
+    }
+
+    pub(crate) fn handle_window_resized(&mut self, new_size: PhysicalSize<u32>) -> Result<()> {
+        self.renderer.resize(new_size)?;
+        Ok(())
     }
 
     pub(crate) fn suspend(&self) {}

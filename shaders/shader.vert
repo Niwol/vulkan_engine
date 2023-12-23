@@ -5,13 +5,14 @@ layout(location = 1) in vec3 in_color;
 
 layout(location = 0) out vec3 fragColor;
 
-layout(binding = 0) uniform MVP {
-    mat4 model;
+layout(push_constant) uniform constants 
+{ 
+    mat4 model; 
     mat4 view;
-    mat4 proj;
-} mvp;
+    mat4 proj; 
+} push_constants;
 
 void main() {
-    gl_Position = mvp.proj * mvp.view * mvp.model * vec4(in_position, 1.0);
+    gl_Position = push_constants.proj * push_constants.view * push_constants.model * vec4(in_position, 1.0);
     fragColor = in_color;
 }
