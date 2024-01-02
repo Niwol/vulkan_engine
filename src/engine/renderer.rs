@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -6,23 +5,15 @@ use smallvec::smallvec;
 
 use anyhow::Result;
 
-use vulkano::buffer::Buffer;
-use vulkano::descriptor_set::allocator::{
-    StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
+use vulkano::image::{ImageCreateInfo, ImageType};
+use vulkano::memory::allocator::{
+    AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter,
 };
-use vulkano::descriptor_set::{DescriptorSet, PersistentDescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::layout::PushConstantRange;
-use vulkano::pipeline::DynamicState;
 use vulkano::swapchain::Surface;
 use vulkano::{
-    buffer::{BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
-    },
-    descriptor_set::layout::{
-        DescriptorBindingFlags, DescriptorSetLayout, DescriptorSetLayoutBinding,
-        DescriptorSetLayoutCreateFlags, DescriptorSetLayoutCreateInfo, DescriptorType,
     },
     device::Device,
     format::{ClearValue, Format},
@@ -31,33 +22,11 @@ use vulkano::{
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
         Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount,
     },
-    memory::allocator::{
-        AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter, StandardMemoryAllocator,
-    },
-    pipeline::{
-        graphics::{
-            color_blend::{
-                ColorBlendAttachmentState, ColorBlendState, ColorBlendStateFlags, ColorComponents,
-            },
-            input_assembly::{InputAssemblyState, PrimitiveTopology},
-            multisample::MultisampleState,
-            rasterization::{
-                CullMode, FrontFace, LineRasterizationMode, PolygonMode, RasterizationState,
-            },
-            vertex_input::{Vertex, VertexDefinition},
-            viewport::{Scissor, Viewport, ViewportState},
-            GraphicsPipelineCreateInfo,
-        },
-        layout::{PipelineLayoutCreateFlags, PipelineLayoutCreateInfo},
-        GraphicsPipeline, PipelineBindPoint, PipelineCreateFlags, PipelineLayout,
-        PipelineShaderStageCreateInfo,
-    },
+    pipeline::graphics::viewport::{Scissor, Viewport},
     render_pass::{
         AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp,
-        Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass,
-        SubpassDescription,
+        Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, SubpassDescription,
     },
-    shader::ShaderStages,
     swapchain::{
         self, ColorSpace, CompositeAlpha, FullScreenExclusive, PresentMode, SurfaceCapabilities,
         SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
@@ -69,37 +38,11 @@ use vulkano::{Validated, VulkanError};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use glam::{Mat4, Vec3};
-
 use crate::camera::Camera3D;
 use crate::vulkan_context::VulkanContext;
 
-use super::mesh::Vertex as MyVertex;
+use super::pipeline_manager::{PipelineManager, VulkanPipeline};
 use super::scene::Scene;
-
-mod shaders {
-    vulkano_shaders::shader! {
-        shaders: {
-            vertex: {
-                ty: "vertex",
-                path: "shaders/shader.vert",
-            },
-
-            fragment: {
-                ty: "fragment",
-                path: "shaders/shader.frag",
-            },
-        },
-    }
-}
-
-#[derive(BufferContents)]
-#[repr(C)]
-struct MVP {
-    model: Mat4,
-    view: Mat4,
-    projection: Mat4,
-}
 
 pub struct Renderer {
     vulkan_context: Arc<VulkanContext>,
@@ -109,16 +52,13 @@ pub struct Renderer {
     _swapchain_images: Vec<Arc<Image>>,
     _swapchain_image_views: Vec<Arc<ImageView>>,
 
+    depth_image: Arc<Image>,
+    depth_image_view: Arc<ImageView>,
+
     render_pass: Arc<RenderPass>,
     framebuffers: Vec<Arc<Framebuffer>>,
 
-    graphic_pipeline: Arc<GraphicsPipeline>,
-    pipeline_layout: Arc<PipelineLayout>,
-    _descriptor_set_layout: Arc<DescriptorSetLayout>,
-    _descriptor_set_allocator: StandardDescriptorSetAllocator,
-
-    mvp_buffer: Subbuffer<[MVP]>,
-    mvp_descriptor_set: Arc<PersistentDescriptorSet>,
+    pipeline_manager: PipelineManager,
 }
 
 impl Renderer {
@@ -129,21 +69,19 @@ impl Renderer {
         let swapchain_image_views =
             Self::create_swapchain_image_views(&swapchain, &swapchain_images)?;
 
-        let render_pass = Self::create_render_pass(&device, &swapchain);
-        let framebuffers =
-            Self::create_framebuffers(&render_pass, &swapchain, &swapchain_image_views)?;
+        let image_extent = swapchain.image_extent();
+        let (depth_image, depth_image_view) =
+            Self::create_depth_image(&vulkan_context, image_extent)?;
 
-        let (graphic_pipeline, pipeline_layout, descriptor_set_layout) =
-            Self::create_graphic_pipeline(&device, &swapchain, &render_pass);
+        let render_pass = Self::create_render_pass(&device, &swapchain, &depth_image);
+        let framebuffers = Self::create_framebuffers(
+            &render_pass,
+            &swapchain,
+            &swapchain_image_views,
+            &depth_image_view,
+        )?;
 
-        let descriptor_set_allocator = Self::create_descriptor_set_allocator(&device);
-
-        let mvp_buffer = Self::create_mvp_buffer(vulkan_context.standard_memory_allocator());
-        let mvp_descriptor_set = Self::create_mvp_descriptor_set(
-            &descriptor_set_allocator,
-            &descriptor_set_layout,
-            &mvp_buffer,
-        );
+        let pipeline_manager = PipelineManager::new(&vulkan_context, &render_pass)?;
 
         Ok(Self {
             vulkan_context,
@@ -153,15 +91,12 @@ impl Renderer {
             _swapchain_images: swapchain_images,
             _swapchain_image_views: swapchain_image_views,
 
+            depth_image,
+            depth_image_view,
+
             render_pass,
             framebuffers,
-            graphic_pipeline,
-            pipeline_layout,
-            _descriptor_set_layout: descriptor_set_layout,
-            _descriptor_set_allocator: descriptor_set_allocator,
-
-            mvp_buffer,
-            mvp_descriptor_set,
+            pipeline_manager,
         })
     }
 
@@ -179,20 +114,12 @@ impl Renderer {
                 Err(e) => panic!("{e}"),
             };
 
-        let view = camera.get_view();
-        {
-            let [width, height] = self.swapchain.image_extent().map(|x| x as f32);
-            let mut buffer_write = self.mvp_buffer.write().unwrap();
-            for mvp in buffer_write.iter_mut() {
-                mvp.view = view;
-                mvp.projection =
-                    Mat4::perspective_rh(f32::to_radians(45.0), width / height, 0.1, 100.0);
-                mvp.projection.as_mut()[1 * 4 + 1] *= -1.0;
-            }
-        }
-
-        let command_buffer =
-            self.record_draw_command_buffer(image_index as usize, scene, camera)?;
+        let command_buffer = self.record_draw_command_buffer(
+            image_index as usize,
+            scene,
+            camera,
+            self.pipeline_manager.normal_pipeline(),
+        )?;
 
         let future = swapchain_future
             .then_execute(
@@ -218,17 +145,65 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn render_depth(&mut self, scene: &Scene, camera: &Camera3D) -> Result<()> {
+        let (image_index, _suboptimal, swapchain_future) =
+            match swapchain::acquire_next_image(self.swapchain.clone(), None)
+                .map_err(Validated::unwrap)
+            {
+                Ok(x) => x,
+                Err(vulkano::VulkanError::OutOfDate) => panic!(),
+                Err(e) => panic!("{e}"),
+            };
+
+        let draw_buffer = self.record_draw_command_buffer(
+            image_index as usize,
+            scene,
+            camera,
+            self.pipeline_manager.depth_pipeline(),
+        )?;
+
+        let future = swapchain_future
+            .then_execute(
+                Arc::clone(self.vulkan_context.graphics_queue()),
+                draw_buffer,
+            )?
+            .then_swapchain_present(
+                Arc::clone(self.vulkan_context.present_queue()),
+                SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index),
+            )
+            .then_signal_fence_and_flush();
+
+        match future.map_err(Validated::unwrap) {
+            Ok(_) => (),
+
+            Err(VulkanError::OutOfDate) => {
+                self.resize(self.window.inner_size())?;
+            }
+
+            Err(e) => panic!("{:#?}", e),
+        }
+
+        Ok(())
+    }
+
     fn record_draw_command_buffer(
         &self,
         image_index: usize,
         scene: &Scene,
         camera: &Camera3D,
+        vulkan_pipeline: &VulkanPipeline,
     ) -> Result<Arc<PrimaryAutoCommandBuffer>> {
+        let pipeline = &vulkan_pipeline.pipeline;
+        let layout = &vulkan_pipeline.layout;
+
         let render_pass_begin_info = RenderPassBeginInfo {
             render_pass: self.render_pass.clone(),
             render_area_offset: [0, 0],
             render_area_extent: self.swapchain.image_extent(),
-            clear_values: vec![Some(ClearValue::Float([0.5, 0.5, 0.5, 1.0]))],
+            clear_values: vec![
+                Some(ClearValue::Float([0.5, 0.5, 0.5, 1.0])),
+                Some(ClearValue::Depth(1.0)),
+            ],
             ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index].clone())
         };
 
@@ -250,21 +225,22 @@ impl Renderer {
         )?;
 
         let [width, height] = self.swapchain.image_extent().map(|x| x as f32);
-        let mut projection = glam::Mat4::perspective_rh(f32::to_radians(45.0), width / height, 0.1, 100.0);
+        let mut projection =
+            glam::Mat4::perspective_rh(f32::to_radians(45.0), width / height, 0.1, 100.0);
         projection.as_mut()[1 * 4 + 1] *= -1.0;
 
         builder
             .begin_render_pass(render_pass_begin_info, subpass_begin_info)?
-            .bind_pipeline_graphics(Arc::clone(&self.graphic_pipeline))?
+            .bind_pipeline_graphics(Arc::clone(pipeline))?
             .push_constants(
-                Arc::clone(&self.pipeline_layout),
+                Arc::clone(layout),
                 16 * size_of::<f32>() as u32,
                 camera.get_view(),
             )?
             .push_constants(
-                Arc::clone(&self.pipeline_layout),
-                2* 16 * size_of::<f32>() as u32,
-                projection
+                Arc::clone(layout),
+                2 * 16 * size_of::<f32>() as u32,
+                projection,
             )?
             .set_viewport(
                 0,
@@ -286,21 +262,10 @@ impl Renderer {
             let vertex_buffer = render_object.mesh().vectex_buffer();
             let index_buffer = render_object.mesh().index_buffer();
 
-            {
-                let mut buffer_write = self.mvp_buffer.write().unwrap();
-                for mvp in buffer_write.iter_mut() {
-                    mvp.model = render_object.transform().transform();
-                }
-            }
-
             builder
                 .bind_vertex_buffers(0, vertex_buffer.clone())?
                 .bind_index_buffer(index_buffer.clone())?
-                .push_constants(
-                    Arc::clone(&self.pipeline_layout),
-                    0,
-                    render_object.transform().transform(),
-                )?
+                .push_constants(Arc::clone(layout), 0, render_object.transform().transform())?
                 .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)?;
         }
 
@@ -449,12 +414,13 @@ impl Renderer {
         render_pass: &Arc<RenderPass>,
         swapchain: &Arc<Swapchain>,
         image_views: &Vec<Arc<ImageView>>,
+        depth_image_view: &Arc<ImageView>,
     ) -> Result<Vec<Arc<Framebuffer>>> {
         let mut framebuffers = Vec::new();
 
         for image_view in image_views.iter() {
             let framebuffer_info = FramebufferCreateInfo {
-                attachments: vec![image_view.clone()],
+                attachments: vec![Arc::clone(image_view), Arc::clone(depth_image_view)],
                 extent: swapchain.image_extent(),
                 layers: 1,
                 ..Default::default()
@@ -466,14 +432,60 @@ impl Renderer {
         Ok(framebuffers)
     }
 
-    fn create_render_pass(device: &Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<RenderPass> {
+    fn create_depth_image(
+        vulkan_context: &Arc<VulkanContext>,
+        image_extent: [u32; 2],
+    ) -> Result<(Arc<Image>, Arc<ImageView>)> {
+        let allocator = Arc::clone(vulkan_context.standard_memory_allocator());
+
+        let depth_image = Image::new(
+            allocator,
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::D32_SFLOAT,
+                view_formats: vec![Format::D32_SFLOAT],
+                extent: [image_extent[0], image_extent[1], 1],
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                sharing: Sharing::Exclusive,
+                initial_layout: ImageLayout::Undefined,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                allocate_preference: MemoryAllocatePreference::AlwaysAllocate,
+                ..Default::default()
+            },
+        )?;
+
+        let depth_image_view = ImageView::new(
+            Arc::clone(&depth_image),
+            ImageViewCreateInfo {
+                view_type: ImageViewType::Dim2d,
+                format: depth_image.format(),
+                component_mapping: ComponentMapping::identity(),
+                subresource_range: ImageSubresourceRange {
+                    aspects: ImageAspects::DEPTH,
+                    mip_levels: 0..1,
+                    array_layers: 0..1,
+                },
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                ..Default::default()
+            },
+        )?;
+
+        Ok((depth_image, depth_image_view))
+    }
+
+    fn create_render_pass(
+        device: &Arc<Device>,
+        swapchain: &Arc<Swapchain>,
+        depth_stencil_image: &Arc<Image>,
+    ) -> Arc<RenderPass> {
         let color_attachment = AttachmentDescription {
             format: swapchain.image_format(),
             samples: SampleCount::Sample1,
             load_op: AttachmentLoadOp::Clear,
             store_op: AttachmentStoreOp::Store,
-            stencil_load_op: Some(AttachmentLoadOp::DontCare),
-            stencil_store_op: Some(AttachmentStoreOp::DontCare),
             initial_layout: ImageLayout::Undefined,
             final_layout: ImageLayout::PresentSrc,
             ..Default::default()
@@ -485,14 +497,31 @@ impl Renderer {
             ..Default::default()
         };
 
-        let color_subpass = SubpassDescription {
-            view_mask: 0,
-            color_attachments: vec![Some(color_attachment_ref)],
+        let depth_attachment = AttachmentDescription {
+            format: depth_stencil_image.format(),
+            samples: SampleCount::Sample1,
+            load_op: AttachmentLoadOp::Clear,
+            store_op: AttachmentStoreOp::DontCare,
+            initial_layout: ImageLayout::Undefined,
+            final_layout: ImageLayout::DepthStencilAttachmentOptimal,
             ..Default::default()
         };
 
-        let attachments = vec![color_attachment];
-        let subpasses = vec![color_subpass];
+        let depth_attachment_ref = AttachmentReference {
+            attachment: 1,
+            layout: ImageLayout::DepthStencilAttachmentOptimal,
+            ..Default::default()
+        };
+
+        let subpass = SubpassDescription {
+            view_mask: 0,
+            color_attachments: vec![Some(color_attachment_ref)],
+            depth_stencil_attachment: Some(depth_attachment_ref),
+            ..Default::default()
+        };
+
+        let attachments = vec![color_attachment, depth_attachment];
+        let subpasses = vec![subpass];
         let dependencies = vec![];
 
         let render_pass_info = RenderPassCreateInfo {
@@ -503,198 +532,6 @@ impl Renderer {
         };
 
         RenderPass::new(device.clone(), render_pass_info).expect("Failed to create render pass")
-    }
-
-    fn create_pipeline_layout(
-        device: &Arc<Device>,
-    ) -> (Arc<PipelineLayout>, Arc<DescriptorSetLayout>) {
-        let mut mvp_bindings = BTreeMap::new();
-        mvp_bindings.insert(
-            0,
-            DescriptorSetLayoutBinding {
-                binding_flags: DescriptorBindingFlags::empty(),
-                descriptor_count: 1,
-                stages: ShaderStages::VERTEX,
-                immutable_samplers: Vec::new(),
-                ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
-            },
-        );
-
-        let mvp_info = DescriptorSetLayoutCreateInfo {
-            flags: DescriptorSetLayoutCreateFlags::empty(),
-            bindings: mvp_bindings,
-            ..Default::default()
-        };
-
-        let mvp_descriptor_set = DescriptorSetLayout::new(device.clone(), mvp_info)
-            .expect("Failed to create descriptor set layout");
-
-        let layout_info = PipelineLayoutCreateInfo {
-            flags: PipelineLayoutCreateFlags::empty(),
-            set_layouts: Vec::new(),
-            push_constant_ranges: vec![PushConstantRange {
-                stages: ShaderStages::VERTEX,
-                offset: 0,
-                size: 3 * 16 * size_of::<f32>() as u32,
-            }],
-            ..Default::default()
-        };
-
-        let pipeline_layout = PipelineLayout::new(device.clone(), layout_info)
-            .expect("Failed to create pipeline layout");
-
-        (pipeline_layout, mvp_descriptor_set)
-    }
-
-    fn create_graphic_pipeline(
-        device: &Arc<Device>,
-        swapchain: &Arc<Swapchain>,
-        render_pass: &Arc<RenderPass>,
-    ) -> (
-        Arc<GraphicsPipeline>,
-        Arc<PipelineLayout>,
-        Arc<DescriptorSetLayout>,
-    ) {
-        let vertex_shader = shaders::load_vertex(device.clone())
-            .expect("Failed to load vertex shader")
-            .entry_point("main")
-            .unwrap();
-        let fragment_shader = shaders::load_fragment(device.clone())
-            .expect("Failed to load fragment shader")
-            .entry_point("main")
-            .unwrap();
-
-        let window_dimensions = swapchain.image_extent();
-        let window_dimensions_f32 = [window_dimensions[0] as f32, window_dimensions[1] as f32];
-
-        let viewport = ViewportState {
-            viewports: smallvec![Viewport {
-                offset: [0.0, 0.0],
-                extent: window_dimensions_f32,
-                depth_range: 0.0..=1.0,
-            }],
-            scissors: smallvec![Scissor {
-                offset: [0, 0],
-                extent: window_dimensions
-            }],
-            ..Default::default()
-        };
-
-        let vertex_input_state = MyVertex::per_vertex()
-            .definition(&vertex_shader.info().input_interface)
-            .expect("Failed to get vertex input state");
-
-        let (pipeline_layout, descriptor_set_layout) = Self::create_pipeline_layout(device);
-
-        let pipeline_info = GraphicsPipelineCreateInfo {
-            flags: PipelineCreateFlags::empty(),
-            stages: smallvec![
-                PipelineShaderStageCreateInfo::new(vertex_shader),
-                PipelineShaderStageCreateInfo::new(fragment_shader),
-            ],
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState {
-                topology: PrimitiveTopology::TriangleList,
-                primitive_restart_enable: false,
-                ..Default::default()
-            }),
-            tessellation_state: None,
-            viewport_state: Some(viewport),
-            rasterization_state: Some(RasterizationState {
-                depth_clamp_enable: false,
-                rasterizer_discard_enable: false,
-                polygon_mode: PolygonMode::Fill,
-                cull_mode: CullMode::Back,
-                front_face: FrontFace::Clockwise,
-                depth_bias: None,
-                line_width: 1.0,
-                line_rasterization_mode: LineRasterizationMode::Default,
-                line_stipple: None,
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: None,
-            color_blend_state: Some(ColorBlendState {
-                flags: ColorBlendStateFlags::empty(),
-                logic_op: None,
-                attachments: vec![ColorBlendAttachmentState {
-                    blend: None,
-                    color_write_mask: ColorComponents::all(),
-                    color_write_enable: true,
-                }],
-                blend_constants: [0.0; 4],
-                ..Default::default()
-            }),
-            subpass: Some(Subpass::from(render_pass.clone(), 0).unwrap().into()),
-            discard_rectangle_state: None,
-
-            dynamic_state: [DynamicState::Viewport, DynamicState::Scissor]
-                .into_iter()
-                .collect(),
-
-            ..GraphicsPipelineCreateInfo::layout(pipeline_layout.clone())
-        };
-
-        let pipeline = GraphicsPipeline::new(device.clone(), None, pipeline_info)
-            .expect("Failed to create graphic pipeline");
-
-        (pipeline, pipeline_layout, descriptor_set_layout)
-    }
-
-    fn create_mvp_buffer(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[MVP]> {
-        let buffer_info = BufferCreateInfo {
-            sharing: Sharing::Exclusive, // TODO: handle sharing accross different queues
-            usage: BufferUsage::UNIFORM_BUFFER,
-            ..Default::default()
-        };
-
-        let allocation_info = AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            allocate_preference: MemoryAllocatePreference::Unknown,
-            ..Default::default()
-        };
-
-        let mut mvp = MVP {
-            model: Mat4::IDENTITY,
-            view: Mat4::look_to_rh(
-                Vec3::new(0.0, 1.0, 3.0),
-                Vec3::new(0.0, -0.2, -1.0),
-                Vec3::new(0.0, 1.0, 0.0),
-            ),
-            projection: Mat4::perspective_rh(f32::to_radians(45.0), 800.0 / 600.0, 0.1, 100.0),
-        };
-
-        mvp.projection.as_mut()[1 * 4 + 1] *= -1.0;
-
-        Buffer::from_iter(allocator.clone(), buffer_info, allocation_info, [mvp])
-            .expect("Failed to create mvp buffer")
-    }
-
-    fn create_descriptor_set_allocator(device: &Arc<Device>) -> StandardDescriptorSetAllocator {
-        let allocator_info = StandardDescriptorSetAllocatorCreateInfo {
-            set_count: 32,
-            update_after_bind: false,
-            ..Default::default()
-        };
-
-        StandardDescriptorSetAllocator::new(device.clone(), allocator_info)
-    }
-
-    fn create_mvp_descriptor_set(
-        descriptor_set_allocator: &StandardDescriptorSetAllocator,
-        descriptor_set_layout: &Arc<DescriptorSetLayout>,
-        mvp_buffer: &Subbuffer<[MVP]>,
-    ) -> Arc<PersistentDescriptorSet> {
-        let write_descriptor = WriteDescriptorSet::buffer(0, mvp_buffer.clone());
-
-        PersistentDescriptorSet::new(
-            descriptor_set_allocator,
-            descriptor_set_layout.clone(),
-            vec![write_descriptor],
-            Vec::new(),
-        )
-        .expect("Failed to create mvp descriptor set")
     }
 
     pub(crate) fn resize(&mut self, new_size: PhysicalSize<u32>) -> Result<()> {
@@ -708,15 +545,23 @@ impl Renderer {
         let new_swapchain_image_views =
             Self::create_swapchain_image_views(&new_swapchain, &new_swapchain_images)?;
 
+        let (new_depth_image, new_depth_image_view) =
+            Self::create_depth_image(&self.vulkan_context, new_swapchain.image_extent())?;
+
         let new_framebuffers = Self::create_framebuffers(
             &self.render_pass,
             &new_swapchain,
             &new_swapchain_image_views,
+            &new_depth_image_view,
         )?;
 
         self.swapchain = new_swapchain;
         self._swapchain_images = new_swapchain_images;
         self._swapchain_image_views = new_swapchain_image_views;
+
+        self.depth_image = new_depth_image;
+        self.depth_image_view = new_depth_image_view;
+
         self.framebuffers = new_framebuffers;
 
         Ok(())

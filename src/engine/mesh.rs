@@ -1,4 +1,4 @@
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     memory::allocator::{AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter},
@@ -17,7 +17,24 @@ pub struct Vertex {
     pub in_position: Vec3,
 
     #[format(R32G32B32_SFLOAT)]
+    pub in_normal: Vec3,
+
+    #[format(R32G32_SFLOAT)]
+    pub in_texture_coord: Vec2,
+
+    #[format(R32G32B32_SFLOAT)]
     pub in_color: Vec3,
+}
+
+impl Default for Vertex {
+    fn default() -> Self {
+        Self {
+            in_position: Vec3::ZERO,
+            in_normal: Vec3::ZERO,
+            in_texture_coord: Vec2::ZERO,
+            in_color: Vec3::ZERO,
+        }
+    }
 }
 
 pub struct Mesh {

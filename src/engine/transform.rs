@@ -20,15 +20,18 @@ impl Transform {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
     }
 
-    pub fn translate(&mut self, translation: Vec3) {
+    pub fn translate(&mut self, translation: Vec3) -> &mut Self {
         self.translation += translation;
+        self
     }
 
-    pub fn rotate(&mut self, _axis: Vec3, _angle: f32) {
+    pub fn rotate(&mut self, _axis: Vec3, _angle: f32) -> &mut Self {
         todo!();
+        self
     }
 
-    pub fn scale(&mut self, scale: Vec3) {
+    pub fn scale(&mut self, scale: Vec3) -> &mut Self {
         self.scale *= scale;
+        self
     }
 }
