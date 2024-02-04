@@ -27,7 +27,6 @@ impl Transform {
 
     pub fn rotate(&mut self, _axis: Vec3, _angle: f32) -> &mut Self {
         todo!();
-        self
     }
 
     pub fn scale(&mut self, scale: Vec3) -> &mut Self {

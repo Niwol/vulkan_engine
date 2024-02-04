@@ -1,48 +1,58 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
-use smallvec::smallvec;
-
 use anyhow::Result;
 
-use vulkano::image::{ImageCreateInfo, ImageType};
-use vulkano::memory::allocator::{
-    AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter,
-};
-use vulkano::swapchain::Surface;
 use vulkano::{
     command_buffer::{
         AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
     },
+    descriptor_set::DescriptorSetWithOffsets,
     device::Device,
     format::{ClearValue, Format},
     image::{
         sampler::ComponentMapping,
         view::{ImageView, ImageViewCreateInfo, ImageViewType},
-        Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount,
+        Image, ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceRange, ImageType,
+        ImageUsage, SampleCount,
     },
-    pipeline::graphics::viewport::{Scissor, Viewport},
+    memory::allocator::{AllocationCreateInfo, MemoryAllocatePreference, MemoryTypeFilter},
+    pipeline::{
+        graphics::viewport::{Scissor, Viewport},
+        Pipeline, PipelineBindPoint,
+    },
     render_pass::{
         AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp,
         Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, SubpassDescription,
     },
     swapchain::{
-        self, ColorSpace, CompositeAlpha, FullScreenExclusive, PresentMode, SurfaceCapabilities,
-        SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
+        self, ColorSpace, CompositeAlpha, FullScreenExclusive, PresentMode, Surface,
+        SurfaceCapabilities, SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
     },
     sync::{GpuFuture, Sharing},
+    Validated, VulkanError,
 };
-use vulkano::{Validated, VulkanError};
 
-use winit::dpi::PhysicalSize;
-use winit::window::Window;
+use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::camera::Camera3D;
-use crate::vulkan_context::VulkanContext;
+use crate::{
+    engine::{
+        ecs::Scene,
+        material::material_manager::MaterialManager,
+        pipeline_manager::{PipelineManager, VulkanPipeline},
+    },
+    vulkan_context::VulkanContext,
+};
 
-use super::pipeline_manager::{PipelineManager, VulkanPipeline};
-use super::scene::Scene;
+use super::ecs::components::MeshComponent;
+
+#[derive(Debug, Clone, Copy)]
+pub enum RenderMode {
+    Default,
+    NormalView,
+    DepthView,
+}
 
 pub struct Renderer {
     vulkan_context: Arc<VulkanContext>,
@@ -59,10 +69,16 @@ pub struct Renderer {
     framebuffers: Vec<Arc<Framebuffer>>,
 
     pipeline_manager: PipelineManager,
+
+    render_mode: RenderMode,
 }
 
 impl Renderer {
-    pub(crate) fn new(vulkan_context: Arc<VulkanContext>, window: Arc<Window>) -> Result<Self> {
+    pub(crate) fn new(
+        vulkan_context: Arc<VulkanContext>,
+        window: Arc<Window>,
+        material_manager: &MaterialManager,
+    ) -> Result<Self> {
         let device = vulkan_context.device();
 
         let (swapchain, swapchain_images) = Self::create_swapchain(&vulkan_context, &window)?;
@@ -81,7 +97,11 @@ impl Renderer {
             &depth_image_view,
         )?;
 
-        let pipeline_manager = PipelineManager::new(&vulkan_context, &render_pass)?;
+        let pipeline_manager = PipelineManager::new(
+            &vulkan_context,
+            &render_pass,
+            Arc::clone(material_manager.material_set_layout()),
+        )?;
 
         Ok(Self {
             vulkan_context,
@@ -97,14 +117,22 @@ impl Renderer {
             render_pass,
             framebuffers,
             pipeline_manager,
+
+            render_mode: RenderMode::Default,
         })
+    }
+
+    pub(crate) fn _set_render_mode(&mut self, render_mode: RenderMode) {
+        self.render_mode = render_mode;
     }
 
     pub fn clear_screen(&self) -> Result<()> {
         todo!("Rendering currently clears automaticaly => TODO: Handle rendering without clearing");
     }
 
-    pub fn render_scene(&mut self, scene: &Scene, camera: &Camera3D) -> Result<()> {
+    pub(crate) fn render_scene(&mut self, scene: &Scene) -> Result<()> {
+        debug_assert!(scene.camera().is_some());
+
         let (image_index, _suboptimal, swapchain_future) =
             match swapchain::acquire_next_image(self.swapchain.clone(), None)
                 .map_err(Validated::unwrap)
@@ -114,12 +142,23 @@ impl Renderer {
                 Err(e) => panic!("{e}"),
             };
 
-        let command_buffer = self.record_draw_command_buffer(
-            image_index as usize,
-            scene,
-            camera,
-            self.pipeline_manager.normal_pipeline(),
-        )?;
+        let command_buffer = match self.render_mode {
+            RenderMode::Default => self.record_draw_command_buffer(
+                image_index as usize,
+                scene,
+                self.pipeline_manager.material_pipeline(),
+            )?,
+            RenderMode::NormalView => self.record_debug_draw_command_buffer(
+                image_index as usize,
+                scene,
+                self.pipeline_manager.normal_pipeline(),
+            )?,
+            RenderMode::DepthView => self.record_debug_draw_command_buffer(
+                image_index as usize,
+                scene,
+                self.pipeline_manager.depth_pipeline(),
+            )?,
+        };
 
         let future = swapchain_future
             .then_execute(
@@ -145,56 +184,15 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn render_depth(&mut self, scene: &Scene, camera: &Camera3D) -> Result<()> {
-        let (image_index, _suboptimal, swapchain_future) =
-            match swapchain::acquire_next_image(self.swapchain.clone(), None)
-                .map_err(Validated::unwrap)
-            {
-                Ok(x) => x,
-                Err(vulkano::VulkanError::OutOfDate) => panic!(),
-                Err(e) => panic!("{e}"),
-            };
-
-        let draw_buffer = self.record_draw_command_buffer(
-            image_index as usize,
-            scene,
-            camera,
-            self.pipeline_manager.depth_pipeline(),
-        )?;
-
-        let future = swapchain_future
-            .then_execute(
-                Arc::clone(self.vulkan_context.graphics_queue()),
-                draw_buffer,
-            )?
-            .then_swapchain_present(
-                Arc::clone(self.vulkan_context.present_queue()),
-                SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index),
-            )
-            .then_signal_fence_and_flush();
-
-        match future.map_err(Validated::unwrap) {
-            Ok(_) => (),
-
-            Err(VulkanError::OutOfDate) => {
-                self.resize(self.window.inner_size())?;
-            }
-
-            Err(e) => panic!("{:#?}", e),
-        }
-
-        Ok(())
-    }
-
     fn record_draw_command_buffer(
         &self,
         image_index: usize,
         scene: &Scene,
-        camera: &Camera3D,
         vulkan_pipeline: &VulkanPipeline,
     ) -> Result<Arc<PrimaryAutoCommandBuffer>> {
         let pipeline = &vulkan_pipeline.pipeline;
         let layout = &vulkan_pipeline.layout;
+        let camera = scene.camera().as_ref().unwrap();
 
         let render_pass_begin_info = RenderPassBeginInfo {
             render_pass: self.render_pass.clone(),
@@ -244,28 +242,137 @@ impl Renderer {
             )?
             .set_viewport(
                 0,
-                smallvec![Viewport {
+                [Viewport {
                     offset: [0.0, 0.0],
                     extent: self.swapchain.image_extent().map(|x| x as f32),
                     depth_range: 0.0..=1.0,
-                }],
+                }]
+                .into_iter()
+                .collect(),
             )?
             .set_scissor(
                 0,
-                smallvec![Scissor {
+                [Scissor {
                     offset: [0, 0],
-                    extent: self.swapchain.image_extent()
-                }],
+                    extent: self.swapchain.image_extent(),
+                }]
+                .into_iter()
+                .collect(),
             )?;
 
-        for render_object in scene.render_objects() {
-            let vertex_buffer = render_object.mesh().vectex_buffer();
-            let index_buffer = render_object.mesh().index_buffer();
+        for (_, mesh_component) in scene.components::<MeshComponent>().unwrap() {
+            let vertex_buffer = mesh_component.mesh.vectex_buffer();
+            let index_buffer = mesh_component.mesh.index_buffer();
+            let material_descriptor_set = Arc::clone(
+                scene
+                    .material_manager()
+                    .descriptor_set(mesh_component.material),
+            );
 
             builder
                 .bind_vertex_buffers(0, vertex_buffer.clone())?
                 .bind_index_buffer(index_buffer.clone())?
-                .push_constants(Arc::clone(layout), 0, render_object.transform().transform())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    Arc::clone(pipeline.layout()),
+                    0,
+                    vec![DescriptorSetWithOffsets::new(material_descriptor_set, [])],
+                )?
+                .push_constants(Arc::clone(layout), 0, mesh_component.model.transform())?
+                .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)?;
+        }
+
+        builder.end_render_pass(subpass_end_info)?;
+
+        let command_buffer = builder.build()?;
+
+        Ok(command_buffer)
+    }
+
+    fn record_debug_draw_command_buffer(
+        &self,
+        image_index: usize,
+        scene: &Scene,
+        vulkan_pipeline: &VulkanPipeline,
+    ) -> Result<Arc<PrimaryAutoCommandBuffer>> {
+        let pipeline = &vulkan_pipeline.pipeline;
+        let layout = &vulkan_pipeline.layout;
+        let camera = scene.camera().as_ref().unwrap();
+
+        let render_pass_begin_info = RenderPassBeginInfo {
+            render_pass: self.render_pass.clone(),
+            render_area_offset: [0, 0],
+            render_area_extent: self.swapchain.image_extent(),
+            clear_values: vec![
+                Some(ClearValue::Float([0.5, 0.5, 0.5, 1.0])),
+                Some(ClearValue::Depth(1.0)),
+            ],
+            ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index].clone())
+        };
+
+        let subpass_begin_info = SubpassBeginInfo {
+            contents: SubpassContents::Inline,
+            ..Default::default()
+        };
+
+        let subpass_end_info = SubpassEndInfo {
+            ..Default::default()
+        };
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.vulkan_context
+                .standard_command_buffer_allocator()
+                .as_ref(),
+            self.vulkan_context.graphics_queue().queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )?;
+
+        let [width, height] = self.swapchain.image_extent().map(|x| x as f32);
+        let mut projection =
+            glam::Mat4::perspective_rh(f32::to_radians(45.0), width / height, 0.1, 100.0);
+        projection.as_mut()[1 * 4 + 1] *= -1.0;
+
+        builder
+            .begin_render_pass(render_pass_begin_info, subpass_begin_info)?
+            .bind_pipeline_graphics(Arc::clone(pipeline))?
+            .push_constants(
+                Arc::clone(layout),
+                16 * size_of::<f32>() as u32,
+                camera.get_view(),
+            )?
+            .push_constants(
+                Arc::clone(layout),
+                2 * 16 * size_of::<f32>() as u32,
+                projection,
+            )?
+            .set_viewport(
+                0,
+                [Viewport {
+                    offset: [0.0, 0.0],
+                    extent: self.swapchain.image_extent().map(|x| x as f32),
+                    depth_range: 0.0..=1.0,
+                }]
+                .into_iter()
+                .collect(),
+            )?
+            .set_scissor(
+                0,
+                [Scissor {
+                    offset: [0, 0],
+                    extent: self.swapchain.image_extent(),
+                }]
+                .into_iter()
+                .collect(),
+            )?;
+
+        for (_, mesh_component) in scene.components::<MeshComponent>().unwrap() {
+            let vertex_buffer = mesh_component.mesh.vectex_buffer();
+            let index_buffer = mesh_component.mesh.index_buffer();
+
+            builder
+                .bind_vertex_buffers(0, vertex_buffer.clone())?
+                .bind_index_buffer(index_buffer.clone())?
+                .push_constants(Arc::clone(layout), 0, mesh_component.model.transform())?
                 .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)?;
         }
 

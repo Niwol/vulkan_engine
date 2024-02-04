@@ -14,19 +14,17 @@ use winit::{
 use anyhow::{Ok, Result};
 
 use crate::engine::input_handler::InputHandler;
-use crate::engine::renderer::Renderer;
 use crate::engine::Engine;
 use crate::vulkan_context::VulkanContext;
 
 pub trait Runable {
+    fn new(engine: &mut Engine) -> Self;
     fn on_update(
         &mut self,
+        engine: &mut Engine,
         input: &InputHandler,
-        window: &Arc<Window>,
         frame_info: &FrameInfo,
     ) -> bool;
-
-    fn render(&mut self, renderer: &mut Renderer);
 }
 
 pub struct FrameInfo {
@@ -69,13 +67,10 @@ where
 
 impl<T> Application<T>
 where
-    T: 'static + Runable,
+    T: Runable,
 {
-    pub fn run_application<B>(application_info: ApplicationInfo, builder: B) -> Result<()>
-    where
-        B: Fn(&Engine) -> T,
-    {
-        let event_loop = EventLoop::new()?;
+    pub fn run_application(application_info: ApplicationInfo) -> Result<()> {
+        let event_loop = EventLoop::new().expect("Failed to create event loop");
         let window = Arc::new(
             WindowBuilder::new()
                 .with_title(application_info.window_title)
@@ -83,12 +78,13 @@ where
                     application_info.window_size,
                 )))
                 .with_resizable(application_info.resizeable)
-                .build(&event_loop)?,
+                .build(&event_loop)
+                .expect("Failed to build window"),
         );
 
         let vulkan_context = Arc::new(VulkanContext::new(&window)?);
-        let engine = Engine::new(Arc::clone(&vulkan_context), Arc::clone(&window))?;
-        let runable = builder(&engine);
+        let mut engine = Engine::new(Arc::clone(&vulkan_context), Arc::clone(&window))?;
+        let runable = T::new(&mut engine);
 
         let mut app = Self {
             runable,
@@ -111,21 +107,24 @@ where
     fn start(&mut self, event_loop: EventLoop<()>) -> Result<()> {
         event_loop.set_control_flow(ControlFlow::Poll);
 
-        event_loop.run(move |event, window_target| {
-            if let Err(error) = self.handle_event(&event, window_target) {
-                panic!("Application error: {:#?}", error);
-            }
-        })?;
+        // TODO: Handle web applications, see EventLoop::run
+        event_loop
+            .run(move |event, window_target| {
+                if let Err(error) = self.handle_event(event, window_target) {
+                    panic!("Application error: {}", error);
+                }
+            })
+            .expect("An event loop error occured");
 
         Ok(())
     }
 
     fn handle_event(
         &mut self,
-        event: &Event<()>,
+        event: Event<()>,
         window_target: &EventLoopWindowTarget<()>,
     ) -> Result<()> {
-        match event {
+        match &event {
             Event::NewEvents(_) => {
                 self.frame_info.delta_time =
                     Instant::elapsed(&self.previous_frame_time).as_secs_f32();
@@ -136,17 +135,19 @@ where
             }
 
             Event::WindowEvent { event, .. } => {
-                self.handle_window_event(&event, window_target)?;
+                self.handle_window_event(event, window_target)?;
             }
 
             Event::Suspended => self.engine.suspend(),
             Event::Resumed => self.engine.resume(Arc::clone(&self.window)),
 
             Event::AboutToWait => {
-                self.runable
-                    .on_update(&self.input_handler, &self.window, &self.frame_info);
-
-                //println!("{:?}", self.input_handler);
+                if !self
+                    .runable
+                    .on_update(&mut self.engine, &self.input_handler, &self.frame_info)
+                {
+                    window_target.exit();
+                }
 
                 self.window.request_redraw();
             }
@@ -187,7 +188,7 @@ where
                 self.engine.handle_window_resized(*new_size)?;
             }
 
-            WindowEvent::RedrawRequested => self.runable.render(self.engine.renderer_mut()),
+            WindowEvent::RedrawRequested => self.engine.render_frame(),
 
             _ => (),
         }
